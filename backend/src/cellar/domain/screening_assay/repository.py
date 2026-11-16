@@ -9,12 +9,18 @@ from datetime import date
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from cellar.domain.screening_assay.activity_types import AggregatedReadout
+from cellar.domain.screening_assay.activity_types import (
+    AggregatedReadout,
+    RunHeader,
+    RunReadoutStats,
+)
 from cellar.domain.screening_assay.collection_coverage import (
     CollectionCoverage,
     EffectiveCollectionCoverage,
 )
 from cellar.domain.screening_assay.dose_response_curve import DoseResponseCurve
+from cellar.domain.screening_assay.measured_curve import CurveChannel, MeasuredCurve
+from cellar.domain.screening_assay.melting_step import MeltingStep
 from cellar.domain.screening_assay.plate_template import PlateTemplate
 from cellar.domain.screening_assay.protocol import Protocol as AssayProtocol
 from cellar.domain.screening_assay.protocol_similarity import ProtocolSimilarityMatch
@@ -97,6 +103,12 @@ class ProtocolRepository(Protocol):
     async def find_by_ids(
         self, workspace_id: uuid.UUID, ids: list[uuid.UUID]
     ) -> list[AssayProtocol]: ...
+    async def find_ids_by_readout_definition_ids(
+        self, workspace_id: uuid.UUID, readout_definition_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, uuid.UUID]:
+        """``{readout_definition_id: protocol_id}``, workspace-scoped."""
+        ...
+
     async def find_active_by_lineage(
         self, workspace_id: uuid.UUID, parent_protocol_id: uuid.UUID
     ) -> AssayProtocol | None: ...
@@ -137,6 +149,12 @@ class ProtocolRepository(Protocol):
     async def next_protocol_code(
         self, workspace_id: uuid.UUID, *, prefix: str, width: int
     ) -> str: ...
+    async def find_ids_with_measured_curves(
+        self, workspace_id: uuid.UUID, protocol_ids: list[uuid.UUID]
+    ) -> set[uuid.UUID]:
+        """The protocols among ``protocol_ids`` with a run that has measured curves (one query)."""
+        ...
+
     async def find_usages(self, workspace_id: uuid.UUID, protocol_id: uuid.UUID) -> list[str]:
         """What still points at this protocol, one chemist-readable phrase each
         (``'campaign "Test-2" (2 readouts)'``, ``'3 runs'``). Empty when nothing
@@ -329,6 +347,24 @@ class RunRepository(Protocol):
     async def aggregate_stats_by_protocol(
         self, workspace_id: uuid.UUID
     ) -> dict[uuid.UUID, tuple[int, date | None]]: ...
+    async def find_headers(
+        self, workspace_id: uuid.UUID, ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, RunHeader]:
+        """Runs by id without plates and wells. Missing ids are dropped."""
+        ...
+
+    async def find_runs_measuring(
+        self,
+        workspace_id: uuid.UUID,
+        protocol_id: uuid.UUID,
+        molecule_ids: list[uuid.UUID],
+        *,
+        run_scope: RunScope,
+    ) -> list[RunHeader]:
+        """Non-rejected runs of the protocol, in ``run_scope``, holding a curve
+        or a readout for at least one of the molecules."""
+        ...
+
     async def find_children(
         self, workspace_id: uuid.UUID, parent_run_id: uuid.UUID
     ) -> list[Run]: ...
@@ -399,15 +435,27 @@ class ReadoutDataRepository(Protocol):
         dose-response definition can't be averaged into a fake endpoint."""
         ...
 
-    async def find_aggregated_by_molecules_and_names(
+    async def find_run_stats(
         self,
         workspace_id: uuid.UUID,
         molecule_ids: list[uuid.UUID],
-        groups: list[tuple[str, str | None]],
-    ) -> dict[uuid.UUID, list[tuple[uuid.UUID, AggregatedReadout]]]:
-        """Raw-layer aggregation across EVERY protocol whose readout-def matches
-        a ``(normalized_name, unit)`` group. Returns, per molecule, one
-        ``(protocol_id, AggregatedReadout)`` per matching readout-def."""
+        specs: list[tuple[uuid.UUID, str | None]],
+        *,
+        run_scope: RunScope,
+        wellless_only: bool = False,
+    ) -> list[RunReadoutStats]:
+        """One replicate summary per (molecule, readout, normalization, run) in
+        ``run_scope``. Rejected runs and outlier wells are always left out.
+        ``specs`` pairs a readout definition with a normalization layer (None =
+        raw). ``wellless_only`` keeps only rows with no plate position (reported
+        endpoints)."""
+        ...
+
+    async def find_readout_definitions_by_names(
+        self, workspace_id: uuid.UUID, groups: list[tuple[str, str | None]]
+    ) -> dict[uuid.UUID, uuid.UUID]:
+        """``{readout_definition_id: protocol_id}`` matching ``(name, unit)``
+        groups by normalized name and canonical unit, across every protocol."""
         ...
 
     async def find_by_molecule_and_definition(
@@ -448,6 +496,21 @@ class ReadoutDataRepository(Protocol):
     ) -> dict[uuid.UUID, int]: ...
     async def delete_computed_for_run(self, workspace_id: uuid.UUID, run_id: uuid.UUID) -> int: ...
     async def delete_for_run(self, workspace_id: uuid.UUID, run_id: uuid.UUID) -> int: ...
+    async def repoint_well(
+        self,
+        workspace_id: uuid.UUID,
+        run_id: uuid.UUID,
+        well_id: uuid.UUID,
+        *,
+        batch_id: uuid.UUID | None,
+        molecule_id: uuid.UUID | None,
+    ) -> int:
+        """Move a position's readout rows to another batch and its molecule (or to none).
+
+        Returns the number of rows changed.
+        """
+        ...
+
     async def save(self, entity: ReadoutData) -> None: ...
     async def save_bulk(self, entities: list[ReadoutData]) -> None: ...
     async def delete(self, workspace_id: uuid.UUID, id: uuid.UUID) -> None: ...
@@ -563,8 +626,14 @@ class DoseResponseCurveRepository(Protocol):
         molecule_ids: list[uuid.UUID],
         readout_definition_ids: list[uuid.UUID] | None = None,
         run_scope: RunScope | None = None,
+        *,
+        exclude_rejected: bool = False,
+        lean: bool = False,
     ) -> dict[uuid.UUID, dict[uuid.UUID, list[DoseResponseCurve]]]:
         """Return ALL curves keyed by (molecule_id, readout_definition_id).
+
+        ``exclude_rejected`` drops curves from rejected runs; ``lean`` skips
+        loading ``raw_data`` / ``excluded_points`` (ranking needs neither).
 
         Returns ``{molecule_id: {readout_definition_id: [curves sorted by run_date desc]}}``.
         Used by the search aggregator and Activity tabs to feed multi-run
@@ -593,6 +662,54 @@ class DoseResponseCurveRepository(Protocol):
     async def save(self, entity: DoseResponseCurve) -> None: ...
     async def delete(self, workspace_id: uuid.UUID, id: uuid.UUID) -> None: ...
     async def delete_by_run(self, workspace_id: uuid.UUID, run_id: uuid.UUID) -> None: ...
+
+
+class MeasuredCurveRepository(Protocol):
+    """Repository for MeasuredCurve entities (written once, removed with the run's data)."""
+
+    async def save_bulk(self, curves: list[MeasuredCurve]) -> None: ...
+    async def find_by_run(
+        self,
+        workspace_id: uuid.UUID,
+        run_id: uuid.UUID,
+        *,
+        channel_key: str | None = None,
+    ) -> list[MeasuredCurve]: ...
+    async def find_by_wells(
+        self, workspace_id: uuid.UUID, well_ids: Sequence[uuid.UUID], *, channel_key: str
+    ) -> list[MeasuredCurve]:
+        """The curves on ``channel_key`` of those positions; positions without one are absent."""
+        ...
+
+    async def list_channels(
+        self, workspace_id: uuid.UUID, run_id: uuid.UUID
+    ) -> list[CurveChannel]: ...
+    async def list_traced(
+        self, workspace_id: uuid.UUID, run_id: uuid.UUID
+    ) -> set[tuple[uuid.UUID, str]]:
+        """The (well id, channel key) pairs of the run that have a trace."""
+        ...
+
+    async def delete_by_run(self, workspace_id: uuid.UUID, run_id: uuid.UUID) -> int: ...
+
+
+@runtime_checkable
+class MeltingStepRepository(Protocol):
+    """Repository for MeltingStep entities (versioned; removed with the run's data)."""
+
+    async def save_bulk(self, steps: list[MeltingStep]) -> None: ...
+    async def add(self, step: MeltingStep) -> None: ...
+    async def update(self, step: MeltingStep, *, expected_version: int) -> None:
+        """Write ``step`` if the stored version is ``expected_version``, else ConflictError."""
+        ...
+
+    async def find_by_id(
+        self, workspace_id: uuid.UUID, step_id: uuid.UUID
+    ) -> MeltingStep | None: ...
+    async def find_by_run(
+        self, workspace_id: uuid.UUID, run_id: uuid.UUID
+    ) -> list[MeltingStep]: ...
+    async def delete_by_run(self, workspace_id: uuid.UUID, run_id: uuid.UUID) -> int: ...
 
 
 @runtime_checkable

@@ -19,11 +19,13 @@ import {
   SelectValue,
 } from "@/shared/components/ui/select";
 import { Plus, RotateCcw, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useUpdateProtocol } from "../hooks/use-protocols";
 import { useResetRunHitCriteria, useSetRunHitCriteria } from "../hooks/use-runs";
 import { buildHitCriterionOptions, optionIdForRule } from "../lib/hit-criteria-options";
+import { isSeriesReadout, runRulesOf } from "../lib/melt-hits";
 import type { HitCriterion, ReadoutDefinition } from "../types";
+import { DeltaTmHint } from "./delta-tm-hint";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,9 +37,16 @@ const OPERATOR_LABELS: Record<string, string> = {
   gte: ">=",
   lte: "<=",
   in: "in",
+  not_between: "outside",
 };
 
-const ALL_OPERATORS = ["gt", "lt", "gte", "lte", "in"] as const;
+type Operator = HitCriterion["operator"];
+const OPERATORS: readonly Operator[] = ["gt", "lt", "gte", "lte", "in", "not_between"];
+
+const boundsOf = (v: HitCriterion["value"]): [number, number] =>
+  Array.isArray(v) && v.length === 2 && v.every((x) => typeof x === "number")
+    ? [v[0] as number, v[1] as number]
+    : [0, 0];
 
 const MAX_RULES = 3;
 
@@ -66,6 +75,7 @@ interface HitCriteriaRulesState {
   handleOptionChange: (index: number, optionId: string) => void;
   handleOperatorChange: (index: number, operator: HitCriterion["operator"]) => void;
   handleValueChange: (index: number, raw: string) => void;
+  handleBoundChange: (index: number, which: 0 | 1, raw: string) => void;
 }
 
 function useHitCriteriaRules(
@@ -130,6 +140,8 @@ function useHitCriteriaRules(
   const handleOperatorChange = (index: number, operator: HitCriterion["operator"]) => {
     if (operator === "in") {
       updateRule(index, { operator, value: [] });
+    } else if (operator === "not_between") {
+      updateRule(index, { operator, value: boundsOf(rules[index].value) });
     } else {
       const current = rules[index].value;
       updateRule(index, {
@@ -148,15 +160,26 @@ function useHitCriteriaRules(
         .filter(Boolean);
       updateRule(index, { value: parts });
     } else {
-      const num = Number.parseFloat(raw);
-      updateRule(index, { value: Number.isNaN(num) ? 0 : num });
+      // Left unparsable ("", "-") so the rule is invalid until it is a number.
+      updateRule(index, { value: Number.parseFloat(raw) });
     }
+  };
+
+  const handleBoundChange = (index: number, which: 0 | 1, raw: string) => {
+    const next = boundsOf(rules[index].value);
+    next[which] = Number.parseFloat(raw); // NaN while unfinished: the rule is invalid
+    updateRule(index, { value: next });
   };
 
   const isValid = rules.every(
     (r) =>
       r.readout_name !== "" &&
-      (r.operator !== "in" || (Array.isArray(r.value) && r.value.length > 0)),
+      (r.operator !== "in" || (Array.isArray(r.value) && r.value.length > 0)) &&
+      (r.operator !== "not_between" || boundsOf(r.value)[0] < boundsOf(r.value)[1]) &&
+      (r.operator === "in" ||
+        r.operator === "not_between" ||
+        r.readout_name === "Curve Class" ||
+        (typeof r.value === "number" && Number.isFinite(r.value))),
   );
 
   return {
@@ -170,7 +193,38 @@ function useHitCriteriaRules(
     handleOptionChange,
     handleOperatorChange,
     handleValueChange,
+    handleBoundChange,
   };
+}
+
+/** A number input that keeps what is typed ("-", "1.") until it is a number,
+ *  so a negative or decimal value can be entered one keystroke at a time. */
+function NumberField({
+  value,
+  onText,
+  className,
+}: {
+  value: number;
+  /** Every edit; the rule holds NaN (and cannot be saved) until it is a number. */
+  onText: (text: string) => void;
+  className?: string;
+}) {
+  const [text, setText] = useState(Number.isNaN(value) ? "" : String(value));
+  // Follow a value set from elsewhere (seeding, a reset), not one being typed.
+  useEffect(() => {
+    setText((t) => (Object.is(Number.parseFloat(t), value) ? t : String(value)));
+  }, [value]);
+  return (
+    <Input
+      className={className}
+      type="number"
+      value={text}
+      onChange={(e) => {
+        setText(e.target.value);
+        onText(e.target.value);
+      }}
+    />
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -180,77 +234,114 @@ function useHitCriteriaRules(
 function HitCriteriaRulesEditor({
   state,
   readoutDefinitions,
+  operators: allowedOperators,
 }: {
   state: HitCriteriaRulesState;
   readoutDefinitions: ReadoutDefinition[];
+  operators: readonly Operator[];
 }) {
   const { rules, rowKeys, options } = state;
   return (
     <div className="space-y-4 py-2">
       {rules.map((rule, index) => {
         const isCurveClass = rule.readout_name === "Curve Class";
-        const operators = isCurveClass ? (["in"] as const) : ALL_OPERATORS;
+        const operators = isCurveClass ? (["in"] as const) : allowedOperators;
+        const isOutside = rule.operator === "not_between";
+        const [low, high] = boundsOf(rule.value);
+        const readout = readoutDefinitions.find((r) => r.name === rule.readout_name);
         return (
-          <div key={rowKeys[index]} className="flex items-end gap-2 rounded-md border p-3">
-            <div className="flex-1 space-y-1">
-              <Label className="text-xs">Readout</Label>
-              <Select
-                value={rule.readout_name === "" ? "" : optionIdForRule(rule, readoutDefinitions)}
-                onValueChange={(v) => state.handleOptionChange(index, v)}
+          <div key={rowKeys[index]} className="space-y-1 rounded-md border p-3">
+            <div className="flex items-end gap-2">
+              <div className="flex-1 space-y-1">
+                <Label className="text-xs">Readout</Label>
+                <Select
+                  value={rule.readout_name === "" ? "" : optionIdForRule(rule, readoutDefinitions)}
+                  onValueChange={(v) => state.handleOptionChange(index, v)}
+                >
+                  <SelectTrigger className="h-9">
+                    <SelectValue placeholder="Select readout" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {options.map((opt) => (
+                      <SelectItem key={opt.id} value={opt.id}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="w-20 space-y-1">
+                <Label className="text-xs">Op</Label>
+                <Select
+                  value={rule.operator}
+                  onValueChange={(v) =>
+                    state.handleOperatorChange(index, v as HitCriterion["operator"])
+                  }
+                >
+                  <SelectTrigger className="h-9">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {operators.map((op) => (
+                      <SelectItem key={op} value={op}>
+                        {OPERATOR_LABELS[op]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {isOutside ? (
+                <>
+                  <div className="w-24 space-y-1">
+                    <Label className="text-xs">Low</Label>
+                    <NumberField
+                      className="h-9"
+                      value={low}
+                      onText={(t) => state.handleBoundChange(index, 0, t)}
+                    />
+                  </div>
+                  <div className="w-24 space-y-1">
+                    <Label className="text-xs">High</Label>
+                    <NumberField
+                      className="h-9"
+                      value={high}
+                      onText={(t) => state.handleBoundChange(index, 1, t)}
+                    />
+                  </div>
+                </>
+              ) : (
+                <div className="w-32 space-y-1">
+                  <Label className="text-xs">Value</Label>
+                  {rule.operator === "in" ? (
+                    <Input
+                      className="h-9"
+                      type="text"
+                      placeholder="full, partial"
+                      value={Array.isArray(rule.value) ? rule.value.join(", ") : rule.value}
+                      onChange={(e) => state.handleValueChange(index, e.target.value)}
+                    />
+                  ) : (
+                    <NumberField
+                      className="h-9"
+                      value={typeof rule.value === "number" ? rule.value : 0}
+                      onText={(t) => state.handleValueChange(index, t)}
+                    />
+                  )}
+                </div>
+              )}
+
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-9 w-9 shrink-0 text-muted-foreground hover:text-destructive"
+                onClick={() => state.removeRule(index)}
               >
-                <SelectTrigger className="h-9">
-                  <SelectValue placeholder="Select readout" />
-                </SelectTrigger>
-                <SelectContent>
-                  {options.map((opt) => (
-                    <SelectItem key={opt.id} value={opt.id}>
-                      {opt.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                <Trash2 className="h-4 w-4" />
+              </Button>
             </div>
-
-            <div className="w-20 space-y-1">
-              <Label className="text-xs">Op</Label>
-              <Select
-                value={rule.operator}
-                onValueChange={(v) =>
-                  state.handleOperatorChange(index, v as HitCriterion["operator"])
-                }
-              >
-                <SelectTrigger className="h-9">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {operators.map((op) => (
-                    <SelectItem key={op} value={op}>
-                      {OPERATOR_LABELS[op]}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div className="w-32 space-y-1">
-              <Label className="text-xs">Value</Label>
-              <Input
-                className="h-9"
-                type={rule.operator === "in" ? "text" : "number"}
-                placeholder={rule.operator === "in" ? "full, partial" : "0"}
-                value={Array.isArray(rule.value) ? rule.value.join(", ") : rule.value}
-                onChange={(e) => state.handleValueChange(index, e.target.value)}
-              />
-            </div>
-
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-9 w-9 shrink-0 text-muted-foreground hover:text-destructive"
-              onClick={() => state.removeRule(index)}
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
+            <DeltaTmHint readout={readout} />
           </div>
         );
       })}
@@ -323,7 +414,11 @@ export function HitCriteriaDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <HitCriteriaRulesEditor state={state} readoutDefinitions={readoutDefinitions} />
+        <HitCriteriaRulesEditor
+          state={state}
+          readoutDefinitions={readoutDefinitions}
+          operators={OPERATORS}
+        />
 
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
@@ -371,11 +466,20 @@ export function RunHitCriteriaDialog({
 }: RunHitCriteriaDialogProps) {
   const setHitCriteria = useSetRunHitCriteria();
   const resetHitCriteria = useResetRunHitCriteria();
-  const seed = currentCriteria ?? recommendation ?? [];
-  const state = useHitCriteriaRules(readoutDefinitions, seed);
+  // A series value is one number per batch; no run view evaluates it (the
+  // server refuses it), so it is neither offered nor carried in.
+  const { kept: seed, dropped } = runRulesOf(
+    currentCriteria ?? recommendation ?? [],
+    readoutDefinitions,
+  );
+  const readouts = useMemo(
+    () => readoutDefinitions.filter((rd) => !isSeriesReadout(rd)),
+    [readoutDefinitions],
+  );
+  const state = useHitCriteriaRules(readouts, seed);
 
   const handleOpenChange = (next: boolean) => {
-    if (next) state.reset(currentCriteria ?? recommendation ?? []);
+    if (next) state.reset(seed);
     onOpenChange(next);
   };
 
@@ -399,7 +503,14 @@ export function RunHitCriteriaDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <HitCriteriaRulesEditor state={state} readoutDefinitions={readoutDefinitions} />
+        {dropped.length > 0 && (
+          <p className="text-sm text-muted-foreground">
+            {`Left out (a series value is not a run rule): ${dropped
+              .map((r) => r.readout_name)
+              .join(", ")}`}
+          </p>
+        )}
+        <HitCriteriaRulesEditor state={state} readoutDefinitions={readouts} operators={OPERATORS} />
 
         <DialogFooter>
           {/* Reset clears the run's recorded decision so it reverts to "unset"

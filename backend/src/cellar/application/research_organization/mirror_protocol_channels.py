@@ -149,7 +149,7 @@ def _primary_normalization(rd: ReadoutDefinition) -> str | None:
 # Stage criteria are numeric-only (StageCriterion forbids the string-based
 # ``in`` operator); a recommended criterion using it is skipped when mapping
 # onto a mirrored stage.
-_NUMERIC_STAGE_OPERATORS = {"lt", "lte", "gt", "gte", "between"}
+_NUMERIC_STAGE_OPERATORS = {"lt", "lte", "gt", "gte", "between", "not_between"}
 
 
 def _match_recommended_threshold(
@@ -289,7 +289,7 @@ class MirrorProtocolChannels:
                             protocol_id=protocol.id,
                             readout_definition_id=rd.id,
                             source_kind=source_kind,
-                            selection_rule=SelectionRule.LATEST_APPROVED_RUN,
+                            selection_rule=SelectionRule.LATEST_RUN,
                             qualifier_handling=QualifierHandling.INCLUDE_QUALIFIED,
                             display_order=next_order,
                             normalization_applied=normalization,

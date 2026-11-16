@@ -45,9 +45,15 @@ import {
 import { Textarea } from "@/shared/components/ui/textarea";
 import { UnitPicker } from "@/shared/components/unit-picker";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ChevronDown, Plus, Trash2 } from "lucide-react";
+import { ChevronDown, Loader2, Plus, Sparkles, Trash2 } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Controller, useFieldArray, useForm } from "react-hook-form";
+import {
+  type ConditionSuggestion,
+  useMethodSuggestionsEnabled,
+  useSuggestFromMethod,
+} from "../hooks/use-method-suggestions";
 import { useProtocolFacetSlots } from "../hooks/use-protocol-facet-slots";
 import { useProtocolNamePreview } from "../hooks/use-protocol-name-preview";
 import { useAssignProtocolToProject } from "../hooks/use-protocol-projects";
@@ -65,6 +71,7 @@ import {
   pickFormForCategory,
   readoutsFromForm,
 } from "../lib/protocol-form-apply";
+import { METHOD_PLACEHOLDER } from "../lib/protocol-method";
 import { prefillFromProtocol } from "../lib/protocol-prefill";
 import { isReservedReadoutName } from "../lib/readout-constants";
 import {
@@ -84,13 +91,20 @@ import {
 } from "./create-protocol/form-values";
 import { NicknameInput } from "./create-protocol/nickname-input";
 import { ReadoutRow } from "./create-protocol/readout-row";
-import { FacetField, NameFacts, factSlots } from "./create-protocol/required-facts";
+import {
+  FacetField,
+  NameFacts,
+  factSlots,
+  hidesFacet,
+  settledSlots,
+} from "./create-protocol/required-facts";
 import {
   SiblingDiscriminators,
   type SiblingValues,
   siblingDiscriminatorsPayload,
 } from "./create-protocol/sibling-discriminators";
 import { StartsFrom } from "./create-protocol/starts-from";
+import { SuggestedConditions } from "./create-protocol/suggested-conditions";
 import { DiscriminatorInput } from "./discriminator-input";
 import { ProtocolCategoryInput } from "./protocol-category-input";
 import { ProtocolNamePreview, isPreviewSavable, useNameSlots } from "./protocol-name-preview";
@@ -125,6 +139,7 @@ export function CreateProtocolDialog({
   onLogRun,
   prefill,
 }: CreateProtocolDialogProps) {
+  const router = useRouter();
   const createMutation = useCreateProtocol();
   const assignToProject = useAssignProtocolToProject();
   const { data: projects } = useProjects();
@@ -163,6 +178,10 @@ export function CreateProtocolDialog({
   const [references, setReferences] = useState<ProtocolReference[]>([]);
   const [siblingValues, setSiblingValues] = useState<SiblingValues>({});
   const [showDiscriminator, setShowDiscriminator] = useState(false);
+  // What the method suggested (null: not asked). Shown for review, never added on its own.
+  const [suggested, setSuggested] = useState<ConditionSuggestion[] | null>(null);
+  const suggestionsOn = useMethodSuggestionsEnabled();
+  const suggest = useSuggestFromMethod();
 
   // ---- react-hook-form setup ----
 
@@ -213,6 +232,7 @@ export function CreateProtocolDialog({
     setReferences([]);
     setSiblingValues({});
     setShowDiscriminator(false);
+    setSuggested(null);
     setDraftKept(false);
   };
 
@@ -326,9 +346,12 @@ export function CreateProtocolDialog({
     focused.current = !!el;
   });
 
-  // Facts the pattern does not place, assay format first.
+  // Facts the pattern does not place, assay format first. Ones a cell-free type settles are left
+  // out unless required or already holding a value (a prefill).
+  const settled = settledSlots(form.watch("protocol_type"));
   const moreSlots = facetSlots
     .filter((s) => !nameFactSlots.includes(s.name))
+    .filter((s) => !hidesFacet(s, settled, ontologyAnnotations[s.name]))
     .sort((a, b) => Number(b.name === "assay_format") - Number(a.name === "assay_format"));
 
   const validReadouts = readoutValues.filter((rd) => rd.name.trim());
@@ -341,6 +364,25 @@ export function CreateProtocolDialog({
   const hasInvalidFixedValue = conditionValues.some(
     (cd) => cd.name.trim() && !isFixedValueValid(cd),
   );
+  const methodValue = form.watch("description");
+  // TanStack runs a mutate call's own callbacks for the latest call only: a slower earlier
+  // answer never replaces a newer one.
+  const suggestFromMethod = () =>
+    suggest.mutate(methodValue.trim(), { onSuccess: (r) => setSuggested(r.conditions) });
+  const listedConditions = new Set(conditionValues.map((cd) => cd.name.trim().toLowerCase()));
+  const openSuggestions = (suggested ?? []).filter(
+    (s) => !listedConditions.has(s.name.toLowerCase()),
+  );
+  const addSuggestion = (s: ConditionSuggestion) =>
+    appendCondition({
+      ...defaultCondition(),
+      name: s.name,
+      data_type: s.data_type,
+      unit: s.unit ?? "",
+    });
+  const dismissSuggestion = (s: ConditionSuggestion) =>
+    setSuggested((prev) => prev?.filter((x) => x.name !== s.name) ?? null);
+
   const canSubmit =
     validReadouts.length > 0 &&
     !hasEmptyPickList &&
@@ -391,6 +433,8 @@ export function CreateProtocolDialog({
           }
           onOpenChange(false);
           resetForm();
+          // Straight on to the draft: its remaining setup and Publish live there.
+          if (protocol?.id) router.push(`/assays/protocols/${protocol.id}`);
         },
       },
     );
@@ -409,7 +453,8 @@ export function CreateProtocolDialog({
             {prefill ? `New protocol from ${prefill.code ?? prefill.name}` : "New Protocol"}
           </DialogTitle>
           <DialogDescription>
-            Pick a category; the name, its facts and the readouts follow from it.
+            Say what you measure, on what, and how; the name and readouts follow. The rest can be
+            set on the draft.
           </DialogDescription>
         </DialogHeader>
 
@@ -448,7 +493,7 @@ export function CreateProtocolDialog({
           {showDiscriminatorField ? (
             <div className="grid gap-2">
               <Label htmlFor="protocol-discriminator">
-                Discriminator{discriminatorInName ? "" : " (optional)"}
+                Distinguished by{discriminatorInName ? "" : " (optional)"}
               </Label>
               <Controller
                 control={form.control}
@@ -489,6 +534,168 @@ export function CreateProtocolDialog({
             newName={preview.data?.name ?? ""}
             onChange={setSiblingValues}
           />
+
+          {/* Before any more effort: maybe this is a run of an existing protocol. */}
+          <SimilarProtocolsPanel
+            draft={{
+              name: preview.data?.name ?? "",
+              protocol_type: form.watch("protocol_type") || null,
+              target_ids: targetIds,
+              readout_names: readoutValues
+                .map((r) => r.name)
+                .filter((n): n is string => Boolean(n)),
+              facet_ids: Object.values(ontologyAnnotations)
+                .flat()
+                .map((t) => t.term_id),
+            }}
+            onLogRun={(protocolId) => {
+              onOpenChange(false);
+              onLogRun?.(protocolId);
+            }}
+          />
+
+          <div className="grid gap-2">
+            <Label htmlFor="protocol-method">Method</Label>
+            <Textarea
+              id="protocol-method"
+              className="min-h-40"
+              placeholder={METHOD_PLACEHOLDER}
+              {...form.register("description")}
+            />
+            <div className="flex items-start justify-between gap-2">
+              <p className="text-xs text-muted-foreground">
+                How the assay is run, so a colleague can repeat it. You can refine it on the draft.
+              </p>
+              {suggestionsOn && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  disabled={!methodValue.trim() || suggest.isPending}
+                  onClick={suggestFromMethod}
+                >
+                  {suggest.isPending ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Sparkles className="mr-2 h-4 w-4" />
+                  )}
+                  {suggest.isPending ? "Reading the method…" : "Suggest from method"}
+                </Button>
+              )}
+            </div>
+          </div>
+
+          <div className="grid gap-2">
+            <div className="flex items-center justify-between">
+              <Label>Assay conditions</Label>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => appendCondition(defaultCondition())}
+              >
+                <Plus className="mr-2 h-4 w-4" />
+                Add Condition
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              What each run records, so its runs can be told apart: concentrations, times,
+              temperatures. Together they define the protocol.
+            </p>
+            <SuggestedConditions
+              suggestions={openSuggestions}
+              onAdd={addSuggestion}
+              onDismiss={dismissSuggestion}
+            />
+            {suggested?.length === 0 && (
+              <p className="text-xs text-muted-foreground">Nothing to suggest from this method.</p>
+            )}
+            {conditionFields.map((field, index) => (
+              <div key={field.id} className="grid gap-2">
+                <div className="flex items-end gap-2">
+                  <div className="grid flex-1 gap-1">
+                    <Label className="text-xs">Name</Label>
+                    <Input
+                      placeholder="e.g., Incubation time"
+                      {...form.register(`conditions.${index}.name`)}
+                    />
+                  </div>
+                  <div className="grid w-[130px] gap-1">
+                    <Label className="text-xs">Type</Label>
+                    <Controller
+                      control={form.control}
+                      name={`conditions.${index}.data_type`}
+                      render={({ field: f }) => (
+                        <Select value={f.value} onValueChange={f.onChange}>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="text">Text</SelectItem>
+                            <SelectItem value="numeric">Numeric</SelectItem>
+                            <SelectItem value="pick_list">Pick List</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      )}
+                    />
+                  </div>
+                  <div className="grid w-40 gap-1">
+                    <Label className="text-xs">Unit</Label>
+                    <Controller
+                      control={form.control}
+                      name={`conditions.${index}.unit`}
+                      render={({ field: f }) => (
+                        <UnitPicker value={f.value} onChange={f.onChange} />
+                      )}
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Remove condition"
+                    className="shrink-0"
+                    onClick={() => removeCondition(index)}
+                  >
+                    <Trash2 className="h-4 w-4 text-destructive" />
+                  </Button>
+                </div>
+                {conditionValues[index]?.data_type === "pick_list" && (
+                  <Controller
+                    control={form.control}
+                    name={`conditions.${index}.pick_list_values`}
+                    render={({ field: f }) => (
+                      <PickListValuesInput values={f.value} onChange={f.onChange} />
+                    )}
+                  />
+                )}
+                <div className="grid gap-1">
+                  <Label className="text-xs">Fixed for this protocol (optional)</Label>
+                  <Controller
+                    control={form.control}
+                    name={`conditions.${index}.fixed_value`}
+                    render={({ field: f }) => (
+                      <ConditionValueInput
+                        def={conditionValues[index] ?? defaultCondition()}
+                        value={f.value}
+                        onChange={f.onChange}
+                        noneLabel="(varies per run)"
+                        aria-label="Fixed for this protocol"
+                      />
+                    )}
+                  />
+                  {conditionValues[index] && !isFixedValueValid(conditionValues[index]) && (
+                    <p className="text-xs text-destructive">
+                      {conditionValues[index].data_type === "numeric"
+                        ? "Must be a number."
+                        : "Must be one of the values."}
+                    </p>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
 
           <StartsFrom
             forms={ownForms.length > 0 ? ownForms : genericForms}
@@ -587,11 +794,6 @@ export function CreateProtocolDialog({
               )}
 
               <div className="grid gap-2">
-                <Label>Description</Label>
-                <Textarea placeholder="Optional description..." {...form.register("description")} />
-              </div>
-
-              <div className="grid gap-2">
                 <Label>Project</Label>
                 <SearchableSelect
                   options={projects?.map((p) => ({ value: p.id, label: p.name })) ?? []}
@@ -601,105 +803,6 @@ export function CreateProtocolDialog({
                   searchPlaceholder="Search projects..."
                   emptyMessage="No projects found."
                 />
-              </div>
-
-              <div className="grid gap-2">
-                <div className="flex items-center justify-between">
-                  <Label>Conditions</Label>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => appendCondition(defaultCondition())}
-                  >
-                    <Plus className="mr-2 h-4 w-4" />
-                    Add Condition
-                  </Button>
-                </div>
-                {conditionFields.map((field, index) => (
-                  <div key={field.id} className="grid gap-2">
-                    <div className="flex items-end gap-2">
-                      <div className="grid flex-1 gap-1">
-                        <Label className="text-xs">Name</Label>
-                        <Input
-                          placeholder="e.g., Incubation time"
-                          {...form.register(`conditions.${index}.name`)}
-                        />
-                      </div>
-                      <div className="grid w-[130px] gap-1">
-                        <Label className="text-xs">Type</Label>
-                        <Controller
-                          control={form.control}
-                          name={`conditions.${index}.data_type`}
-                          render={({ field: f }) => (
-                            <Select value={f.value} onValueChange={f.onChange}>
-                              <SelectTrigger>
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="text">Text</SelectItem>
-                                <SelectItem value="numeric">Numeric</SelectItem>
-                                <SelectItem value="pick_list">Pick List</SelectItem>
-                              </SelectContent>
-                            </Select>
-                          )}
-                        />
-                      </div>
-                      <div className="grid w-40 gap-1">
-                        <Label className="text-xs">Unit</Label>
-                        <Controller
-                          control={form.control}
-                          name={`conditions.${index}.unit`}
-                          render={({ field: f }) => (
-                            <UnitPicker value={f.value} onChange={f.onChange} />
-                          )}
-                        />
-                      </div>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        aria-label="Remove condition"
-                        className="shrink-0"
-                        onClick={() => removeCondition(index)}
-                      >
-                        <Trash2 className="h-4 w-4 text-destructive" />
-                      </Button>
-                    </div>
-                    {conditionValues[index]?.data_type === "pick_list" && (
-                      <Controller
-                        control={form.control}
-                        name={`conditions.${index}.pick_list_values`}
-                        render={({ field: f }) => (
-                          <PickListValuesInput values={f.value} onChange={f.onChange} />
-                        )}
-                      />
-                    )}
-                    <div className="grid gap-1">
-                      <Label className="text-xs">Fixed for this protocol (optional)</Label>
-                      <Controller
-                        control={form.control}
-                        name={`conditions.${index}.fixed_value`}
-                        render={({ field: f }) => (
-                          <ConditionValueInput
-                            def={conditionValues[index] ?? defaultCondition()}
-                            value={f.value}
-                            onChange={f.onChange}
-                            noneLabel="(varies per run)"
-                            aria-label="Fixed for this protocol"
-                          />
-                        )}
-                      />
-                      {conditionValues[index] && !isFixedValueValid(conditionValues[index]) && (
-                        <p className="text-xs text-destructive">
-                          {conditionValues[index].data_type === "numeric"
-                            ? "Must be a number."
-                            : "Must be one of the values."}
-                        </p>
-                      )}
-                    </div>
-                  </div>
-                ))}
               </div>
 
               {readoutValues.some((r) => r.data_type === "dose_response") && (
@@ -730,24 +833,6 @@ export function CreateProtocolDialog({
               )}
             </CollapsibleContent>
           </Collapsible>
-
-          <SimilarProtocolsPanel
-            draft={{
-              name: preview.data?.name ?? "",
-              protocol_type: form.watch("protocol_type") || null,
-              target_ids: targetIds,
-              readout_names: readoutValues
-                .map((r) => r.name)
-                .filter((n): n is string => Boolean(n)),
-              facet_ids: Object.values(ontologyAnnotations)
-                .flat()
-                .map((t) => t.term_id),
-            }}
-            onLogRun={(protocolId) => {
-              onOpenChange(false);
-              onLogRun?.(protocolId);
-            }}
-          />
         </div>
 
         <DialogFooter className="sm:items-center">

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { SearchQuery } from "../../types";
-import { countSearchCriteria, decomposeQuery } from "./search-form";
+import {
+  cleanActivityCriterion,
+  countSearchCriteria,
+  decomposeQuery,
+  hasUnpickedRuns,
+} from "./search-form";
 
 const act = (protocol_id: string) => ({ type: "activity" as const, protocol_id, where: [] });
 
@@ -39,5 +44,59 @@ describe("countSearchCriteria", () => {
       ]),
     ).toBe(4);
     expect(countSearchCriteria([])).toBe(0);
+  });
+});
+
+describe("cleanActivityCriterion", () => {
+  it("drops a condition split with no condition chosen", () => {
+    const cleaned = cleanActivityCriterion({
+      type: "activity",
+      protocol_id: "p1",
+      where: [],
+      split: { by: "condition", condition: "" },
+    });
+    expect(cleaned.split).toBeUndefined();
+  });
+
+  it("keeps a complete split", () => {
+    const split = { by: "condition" as const, condition: "ATP" };
+    expect(
+      cleanActivityCriterion({ type: "activity", protocol_id: "p1", where: [], split }).split,
+    ).toEqual(split);
+  });
+});
+
+describe("decomposeQuery — split", () => {
+  it("keeps a saved search's split on its protocol row", () => {
+    const query: SearchQuery = {
+      criteria: [
+        {
+          type: "activity",
+          protocol_id: "p1",
+          where: [],
+          split: { by: "condition", condition: "ATP" },
+        },
+      ],
+    };
+    const { activityCriteria } = decomposeQuery(query);
+    expect(activityCriteria[0].split).toEqual({ by: "condition", condition: "ATP" });
+  });
+});
+
+describe("hasUnpickedRuns", () => {
+  it("is unfinished while Specific runs has no run picked", () => {
+    expect(hasUnpickedRuns({ ...act("p1"), run_scope: { mode: "specific", run_ids: [] } })).toBe(
+      true,
+    );
+  });
+
+  it("is finished once a run is picked, in either saved shape", () => {
+    expect(
+      hasUnpickedRuns({ ...act("p1"), run_scope: { mode: "specific", run_ids: ["r1"] } }),
+    ).toBe(false);
+    expect(hasUnpickedRuns({ ...act("p1"), run_scope: { mode: "specific", run_id: "r1" } })).toBe(
+      false,
+    );
+    expect(hasUnpickedRuns({ ...act("p1"), run_scope: { mode: "latest" } })).toBe(false);
   });
 });

@@ -256,6 +256,7 @@ def create_app() -> FastAPI:
     from cellar.interface.routes.organizations import router as org_router
     from cellar.interface.routes.protocol_categories import router as protocol_categories_router
     from cellar.interface.routes.protocol_names import router as protocol_names_router
+    from cellar.interface.routes.protocol_suggestions import router as protocol_suggestions_router
     from cellar.interface.routes.protocols import router as protocol_router
     from cellar.interface.routes.readout_data import router as readout_data_router
     from cellar.interface.routes.relationships import router as rel_router
@@ -281,6 +282,7 @@ def create_app() -> FastAPI:
     app.include_router(workspace_setup_router)
     app.include_router(naming_labels_router)
     app.include_router(protocol_names_router)
+    app.include_router(protocol_suggestions_router)
     from cellar.interface.routes.export import legacy_router as export_legacy_router
     from cellar.interface.routes.export import router as export_router
 
@@ -350,10 +352,12 @@ def create_app() -> FastAPI:
     from cellar.interface.routes.collections import router as collection_router
     from cellar.interface.routes.favorites import router as favorites_router
     from cellar.interface.routes.projects import router as project_router
+    from cellar.interface.routes.recent_searches import router as recent_searches_router
     from cellar.interface.routes.saved_searches import router as saved_search_router
 
     app.include_router(project_router)
     app.include_router(favorites_router)
+    app.include_router(recent_searches_router)
     app.include_router(collection_router)
     app.include_router(collection_import_previews_router)
     app.include_router(collection_import_templates_router)
@@ -398,6 +402,18 @@ def create_app() -> FastAPI:
     from cellar.interface.routes.run_import import router as run_import_router
 
     app.include_router(run_import_router)
+
+    from cellar.interface.routes.measured_curves import router as measured_curves_router
+
+    app.include_router(measured_curves_router)
+
+    from cellar.interface.routes.melting_steps import router as melting_steps_router
+
+    app.include_router(melting_steps_router)
+
+    from cellar.interface.routes.run_positions import router as run_positions_router
+
+    app.include_router(run_positions_router)
 
     from cellar.interface.routes.attachments import router as attachment_router
 

@@ -41,6 +41,9 @@ const state = vi.hoisted(() => ({
   realPreview: false,
   extraForms: [] as unknown[],
   draft: null as unknown,
+  push: vi.fn(),
+  suggestionsOn: false,
+  suggest: vi.fn(),
 }));
 state.preview = incomplete;
 afterEach(() => {
@@ -48,7 +51,11 @@ afterEach(() => {
   state.realPreview = false;
   state.extraForms = [];
   state.mutate.mockReset();
+  state.push.mockReset();
+  state.suggestionsOn = false;
+  state.suggest.mockReset();
 });
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push: state.push }) }));
 
 // The preview is canned, unless a test runs the real hook against the canned server response.
 vi.mock("../hooks/use-protocol-name-preview", async (importOriginal) => {
@@ -70,6 +77,10 @@ vi.mock("@/shared/lib/api/custom-instance", () => ({
 vi.mock("../hooks/use-protocols", () => ({
   useCreateProtocol: () => ({ mutate: state.mutate, isPending: false }),
   useProtocols: () => ({ data: [] }),
+}));
+vi.mock("../hooks/use-method-suggestions", () => ({
+  useMethodSuggestionsEnabled: () => state.suggestionsOn,
+  useSuggestFromMethod: () => ({ mutate: state.suggest, isPending: false }),
 }));
 vi.mock("../hooks/use-targets", () => ({ useTargets: () => ({ data: [] }) }));
 vi.mock("../hooks/use-protocol-projects", () => ({
@@ -159,6 +170,7 @@ vi.mock("@/features/workspace-config/hooks/use-protocol-forms", () => ({
         workspace_id: "w1",
         name: "CC50",
         category_id: "c-cy",
+        protocol_type: "cell_based",
         is_default: true,
         assay_format_from_target: false,
         version: 1,
@@ -323,9 +335,9 @@ describe("CreateProtocolDialog", () => {
       expect(labels().slice(0, 2)).toEqual(["Category", needed]);
       // Facts the pattern does not need wait under More details.
       expect(labels()).not.toContain(other);
-      expect(labels()).not.toContain("Cell line");
+      expect(labels()).not.toContain("Assay format");
       openMoreDetails();
-      expect(labels()).toContain("Cell line");
+      expect(labels()).toContain("Assay format");
     },
   );
 
@@ -335,7 +347,17 @@ describe("CreateProtocolDialog", () => {
     expect(labels().slice(0, 2)).toEqual(["Category", "Organism (optional)"]);
     openMoreDetails();
     expect(labels().filter((l) => l?.startsWith("Organism"))).toEqual(["Organism (optional)"]);
-    expect(labels()).toContain("Cell line");
+    expect(labels()).toContain("Assay format");
+  });
+
+  it("leaves out facets a cell-free type already settles", () => {
+    render(<CreateProtocolDialog open onOpenChange={() => {}} />);
+    pickCategory("Enzyme inhibition");
+    openMoreDetails();
+    expect(labels()).not.toContain("Cell line");
+    expect(labels()).not.toContain("Strain");
+    pickCategory("Cytotoxicity");
+    expect(labels()).toContain("Strain");
   });
 
   it("shows the organism and an optional strain inline when the pattern names a strain", () => {
@@ -348,19 +370,19 @@ describe("CreateProtocolDialog", () => {
   it("asks for a discriminator only when the pattern places it, else one click away", () => {
     render(<CreateProtocolDialog open onOpenChange={() => {}} />);
     pickCategory("Detection interference");
-    expect(labels()).toContain("Discriminator");
+    expect(labels()).toContain("Distinguished by");
     expect(screen.queryByRole("button", { name: /method or condition/ })).not.toBeInTheDocument();
 
     pickCategory("Solubility");
-    expect(labels()).not.toContain("Discriminator");
+    expect(labels()).not.toContain("Distinguished by");
     fireEvent.click(screen.getByRole("button", { name: /method or condition/ }));
-    expect(labels()).toContain("Discriminator (optional)");
+    expect(labels()).toContain("Distinguished by (optional)");
   });
 
-  it("links the Discriminator label to its input", () => {
+  it("links the Distinguished by label to its input", () => {
     render(<CreateProtocolDialog open onOpenChange={() => {}} />);
     pickCategory("Detection interference");
-    expect(screen.getByLabelText("Discriminator")).toBe(
+    expect(screen.getByLabelText("Distinguished by")).toBe(
       screen.getByPlaceholderText("Part of this category's name"),
     );
   });
@@ -384,9 +406,9 @@ describe("CreateProtocolDialog", () => {
 
   it("starts from the category's default form", () => {
     render(<CreateProtocolDialog open onOpenChange={() => {}} />);
-    expect(screen.queryByText("Starts from")).not.toBeInTheDocument();
+    expect(screen.queryByText("What it reports")).not.toBeInTheDocument();
     pickCategory("Growth inhibition");
-    expect(screen.getByText("Starts from")).toBeInTheDocument();
+    expect(screen.getByText("What it reports")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "MIC" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByDisplayValue("MIC")).toBeInTheDocument();
     expect(screen.queryByText(/Replace your readouts/)).not.toBeInTheDocument();
@@ -456,11 +478,11 @@ describe("CreateProtocolDialog", () => {
     expect(payload.condition_definitions).toBeUndefined();
   });
 
-  it("clears what a form applied when Blank is picked", async () => {
+  it("clears what a form applied when Custom is picked", async () => {
     state.preview = complete;
     render(<CreateProtocolDialog open onOpenChange={() => {}} />);
     pickCategory("Growth inhibition");
-    fireEvent.click(screen.getByRole("button", { name: "Blank" }));
+    fireEvent.click(screen.getByRole("button", { name: "Custom" }));
     const payload = await submit();
     expect(payload.form_id).toBeNull();
     expect(payload.ontology_annotations).toEqual({});
@@ -623,7 +645,7 @@ describe("CreateProtocolDialog", () => {
     expect(screen.getByRole("button", { name: "Hypoxia" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Normoxia" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "72 h" }));
-    expect(screen.getByLabelText("Discriminator (optional)")).toHaveValue("72 h");
+    expect(screen.getByLabelText("Distinguished by (optional)")).toHaveValue("72 h");
   });
 
   it("moves a concentration out of a readout name into the Test concentration condition", async () => {
@@ -716,7 +738,7 @@ describe("CreateProtocolDialog", () => {
     render(<CreateProtocolDialog open onOpenChange={() => {}} />);
     pickCategory("Enzyme inhibition");
     expect(state.draft).toMatchObject({ category: "Enzyme inhibition", form_id: "f2" });
-    fireEvent.click(screen.getByRole("button", { name: "Blank" }));
+    fireEvent.click(screen.getByRole("button", { name: "Custom" }));
     expect(state.draft).toMatchObject({ form_id: null });
   });
 
@@ -735,7 +757,7 @@ describe("CreateProtocolDialog", () => {
   it("hides Dose unit until a readout fits dose-response curves", () => {
     const { unmount } = render(<CreateProtocolDialog open onOpenChange={() => {}} />);
     openMoreDetails();
-    expect(screen.getByText("Description")).toBeInTheDocument();
+    expect(screen.getByText("Project")).toBeInTheDocument();
     expect(screen.queryByText("Dose unit")).not.toBeInTheDocument();
     unmount();
 
@@ -793,7 +815,9 @@ describe("CreateProtocolDialog", () => {
     fireEvent.keyDown(nickname, { key: "Enter" });
     expect(screen.getByText(/already the protocol's name/)).toBeInTheDocument();
     expect(nickname).toHaveAttribute("aria-invalid", "true");
-    expect(screen.queryByRole("button", { name: /^Remove / })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^Remove m\. abscessus/i }),
+    ).not.toBeInTheDocument();
 
     fireEvent.change(nickname, { target: { value: "Mabs MIC" } });
     expect(screen.queryByText(/already the protocol's name/)).not.toBeInTheDocument();
@@ -840,7 +864,7 @@ describe("CreateProtocolDialog", () => {
     state.preview = { ...complete, siblings: [{ protocol_id: "s1", code: "PRT-1", name: "n" }] };
     const prefill = protocol({ category: "Detection interference" });
     render(<CreateProtocolDialog open onOpenChange={() => {}} prefill={prefill} />);
-    await waitFor(() => expect(screen.getByLabelText("Discriminator")).toHaveFocus());
+    await waitFor(() => expect(screen.getByLabelText("Distinguished by")).toHaveFocus());
   });
 
   it("focuses the strain when the pattern names one and no discriminator is shown", async () => {
@@ -889,6 +913,96 @@ describe("CreateProtocolDialog", () => {
           reason: "Distinguish from the new protocol (M. tuberculosis growth inhibition [REMA])",
         },
       ],
+    });
+  });
+  it("sends the method and opens the new draft once it is created", async () => {
+    state.preview = { ...incomplete, name: "InhA inhibition", missing: [], missing_labels: [] };
+    state.mutate.mockImplementation((_body, opts) => opts.onSuccess({ id: "new-1" }));
+    render(<CreateProtocolDialog open onOpenChange={() => {}} />);
+    pickCategory("Growth inhibition");
+    const method = "Procedure:\n1. Preincubate 10 min\n2. Read A340";
+    fireEvent.change(screen.getByLabelText("Method"), { target: { value: method } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Protocol" }));
+    await waitFor(() => expect(state.push).toHaveBeenCalledWith("/assays/protocols/new-1"));
+    expect(state.mutate.mock.calls[0][0]).toMatchObject({ description: method });
+  });
+
+  describe("suggestions from the method", () => {
+    const METHOD = "Buffer at pH 6.8.\n1. Preincubate 10 min at 25 °C.";
+    const FOUND = [
+      {
+        name: "pH",
+        data_type: "numeric",
+        unit: null,
+        evidence: [{ value: "6.8", quote: "Buffer at pH 6.8." }],
+      },
+      {
+        name: "Temperature",
+        data_type: "numeric",
+        unit: "°C",
+        evidence: [{ value: "25 °C", quote: "1. Preincubate 10 min at 25 °C." }],
+      },
+    ];
+    const askWith = (conditions: unknown[]) => {
+      state.suggestionsOn = true;
+      state.suggest.mockImplementation((_method, opts) => opts.onSuccess({ conditions }));
+    };
+    const writeAndAsk = () => {
+      fireEvent.change(screen.getByLabelText("Method"), { target: { value: `  ${METHOD}\n` } });
+      fireEvent.click(screen.getByRole("button", { name: "Suggest from method" }));
+    };
+
+    it("is off unless the deployment has a classifier", () => {
+      render(<CreateProtocolDialog open onOpenChange={() => {}} />);
+      expect(screen.queryByRole("button", { name: "Suggest from method" })).not.toBeInTheDocument();
+    });
+
+    it("waits for a method", () => {
+      state.suggestionsOn = true;
+      render(<CreateProtocolDialog open onOpenChange={() => {}} />);
+      expect(screen.getByRole("button", { name: "Suggest from method" })).toBeDisabled();
+    });
+
+    it("adds only what the person adds, as a definition without a fixed value", async () => {
+      state.preview = complete;
+      askWith(FOUND);
+      render(<CreateProtocolDialog open onOpenChange={() => {}} />);
+      pickCategory("Enzyme inhibition");
+      writeAndAsk();
+      expect(state.suggest).toHaveBeenCalledWith(METHOD, expect.anything());
+      expect(screen.getByText("25 °C", { selector: "mark" })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Add Temperature" }));
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss pH" }));
+      expect(
+        screen.queryByRole("button", { name: /Add (pH|Temperature)/ }),
+      ).not.toBeInTheDocument();
+      const payload = await submit();
+      expect(payload.condition_definitions).toEqual([
+        { name: "Temperature", data_type: "numeric", unit: "°C" },
+      ]);
+    });
+
+    it("keeps an added suggestion when the category's form changes", async () => {
+      state.preview = complete;
+      askWith(FOUND);
+      render(<CreateProtocolDialog open onOpenChange={() => {}} />);
+      pickCategory("Growth inhibition");
+      writeAndAsk();
+      fireEvent.click(screen.getByRole("button", { name: "Add pH" }));
+      pickCategory("Cytotoxicity");
+      const payload = await submit();
+      expect(payload.condition_definitions).toContainEqual({
+        name: "pH",
+        data_type: "numeric",
+        unit: null,
+      });
+    });
+
+    it("leaves out what is already listed, and says when nothing was found", () => {
+      askWith([]);
+      render(<CreateProtocolDialog open onOpenChange={() => {}} />);
+      writeAndAsk();
+      expect(screen.getByText("Nothing to suggest from this method.")).toBeInTheDocument();
     });
   });
 });

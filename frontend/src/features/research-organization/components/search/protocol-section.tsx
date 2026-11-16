@@ -7,7 +7,12 @@ import {
   useProtocol,
   useProtocolSummaries,
 } from "@/features/screening-assay/hooks/use-protocols";
-import { CURVE_CLASS_LABELS, type Protocol } from "@/features/screening-assay/types";
+import {
+  CURVE_CLASS_LABELS,
+  PROTOCOL_TYPE_LABELS,
+  type Protocol,
+  type ProtocolType,
+} from "@/features/screening-assay/types";
 import { Badge } from "@/shared/components/ui/badge";
 import { Button } from "@/shared/components/ui/button";
 import { Checkbox } from "@/shared/components/ui/checkbox";
@@ -31,8 +36,8 @@ import {
 } from "@/shared/components/ui/select";
 import { formatRelativeDay } from "@/shared/lib/format-date";
 import { cn } from "@/shared/lib/utils";
-import { Check, ChevronsUpDown, Minus, Plus } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Check, ChevronsUpDown, Minus, Plus, X } from "lucide-react";
+import { useCallback, useMemo, useState } from "react";
 import {
   CURVE_CLASS_OPTIONS,
   POTENCY_UM_OPTION_ID,
@@ -49,6 +54,7 @@ import type {
   RunScope,
 } from "../../types";
 import { RunScopePicker } from "./run-scope-picker";
+import { LATEST_UNDER_CONDITION_SPLIT, SplitPicker, withRunScope } from "./split-picker";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -118,11 +124,21 @@ function readWhere(c: ActivityCriterion): ActivityWhereCondition[] {
 
 interface ProtocolRowProps {
   protocol: ProtocolSummary;
+  /** What the assay can be filtered on (IC50, % inhibition, …). */
+  endpoints: string[];
   selected: boolean;
   onPick: () => void;
 }
 
-function ProtocolRow({ protocol, selected, onPick }: ProtocolRowProps) {
+/** Endpoints a protocol's results can be filtered on — the labels the
+ *  activity-condition picker offers, minus the generic Curve Class entry. */
+function endpointLabels(protocol: Protocol): string[] {
+  return buildActivityWhereOptions(protocol)
+    .filter((o) => o.group !== "curve_class")
+    .map((o) => o.label);
+}
+
+function ProtocolRow({ protocol, endpoints, selected, onPick }: ProtocolRowProps) {
   const isArchived = protocol.status === "retired" || protocol.status === "archived";
   // Build a haystack so Command's filter can hit name + all targets + status.
   const targets = protocol.targets ?? [];
@@ -150,10 +166,8 @@ function ProtocolRow({ protocol, selected, onPick }: ProtocolRowProps) {
         />
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex items-center gap-1.5">
-            <span
-              className={cn("line-clamp-2 text-sm", isArchived && "text-muted-foreground italic")}
-            >
-              <ProtocolOptionLabel code={protocol.code} name={protocol.name} />
+            <span className={cn("min-w-0 text-sm", isArchived && "text-muted-foreground italic")}>
+              <ProtocolOptionLabel code={protocol.code} name={protocol.name} wrap />
             </span>
             {isArchived && (
               <span className="rounded-full border border-muted-foreground/20 px-1.5 text-[10px] uppercase tracking-wider text-muted-foreground shrink-0">
@@ -161,14 +175,35 @@ function ProtocolRow({ protocol, selected, onPick }: ProtocolRowProps) {
               </span>
             )}
           </div>
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
             {targets.length > 0 && <TargetChips targets={targets} />}
+            <span>
+              {PROTOCOL_TYPE_LABELS[protocol.protocol_type as ProtocolType] ??
+                protocol.protocol_type}
+            </span>
+            <span aria-hidden>·</span>
             <span className="tabular-nums">
               {protocol.run_count} run{protocol.run_count === 1 ? "" : "s"}
             </span>
             <span aria-hidden>·</span>
             <span>last {formatLastRun(protocol.last_run_date ?? null)}</span>
+            {endpoints.length > 0 && (
+              <>
+                <span aria-hidden>·</span>
+                {/* Thermal-shift protocols carry a dozen readouts; four is
+                    enough to recognise the assay, the title has the rest. */}
+                <span className="text-foreground/70" title={endpoints.join(", ")}>
+                  {endpoints.slice(0, 4).join(", ")}
+                  {endpoints.length > 4 && ` +${endpoints.length - 4}`}
+                </span>
+              </>
+            )}
           </div>
+          {protocol.description && (
+            <p className="truncate text-xs text-muted-foreground/80" title={protocol.description}>
+              {protocol.description}
+            </p>
+          )}
         </div>
       </div>
     </CommandItem>
@@ -272,7 +307,7 @@ function WhereRow({ cond, isFirst, options, anyProtocol, onChange, onRemove }: W
   return (
     <div className="flex items-center gap-1.5 flex-wrap">
       {/* Conjunction label — first row says "where", subsequent rows say "and" */}
-      <span className="text-sm text-muted-foreground shrink-0 w-16">
+      <span className="text-sm text-muted-foreground shrink-0 w-24">
         {isFirst ? "Endpoint" : "and"}
       </span>
 
@@ -561,10 +596,56 @@ interface ActivityRowProps {
    * `onChange` and pristine no longer applies.
    */
   isPristine?: boolean;
+  /** An earlier row names the same protocol with a different run filter or
+   *  split — the search can't tell which runs feed this protocol's columns. */
+  conflictsWithEarlierRow?: boolean;
   onShowAllProjectsChange: (next: boolean) => void;
   onConjunctionChange: (conj: ProtocolConjunction) => void;
   onChange: (c: ActivityCriterion) => void;
-  onRemove: () => void;
+  /** Omitted for the only assay — the section's own × removes it. */
+  onRemove?: () => void;
+}
+
+/** True when an earlier row names the same protocol with a different run
+ *  filter or split (the backend can't plan that protocol's columns). */
+export function conflictsWithEarlierRow(criteria: ActivityCriterion[], index: number): boolean {
+  const row = criteria[index];
+  if (!row.protocol_id) return false;
+  const settings = (c: ActivityCriterion) =>
+    JSON.stringify([
+      c.run_scope?.mode === "any" ? undefined : (c.run_scope ?? undefined),
+      c.split ?? undefined,
+    ]);
+  return criteria
+    .slice(0, index)
+    .some((c) => c.protocol_id === row.protocol_id && settings(c) !== settings(row));
+}
+
+/** The criterion after choosing protocol ``next`` (null = any protocol).
+ *
+ *  The where-option vocabulary differs between a specific protocol and "any",
+ *  so crossing that line resets the where-list. Run scope is per-protocol and
+ *  drops on "any"; hand-picked runs and the split belong to the old protocol
+ *  and always drop. */
+export function pickProtocolCriterion(
+  criterion: ActivityCriterion,
+  next: string | null,
+): ActivityCriterion {
+  const crossed = (criterion.protocol_id === null) !== (next === null);
+  const changed = criterion.protocol_id !== next;
+  const runScope =
+    next === null || (changed && criterion.run_scope?.mode === "specific")
+      ? undefined
+      : criterion.run_scope;
+  return {
+    ...criterion,
+    protocol_id: next,
+    where: crossed ? [] : criterion.where,
+    run_scope: runScope,
+    split: changed ? undefined : criterion.split,
+    readout_definition_id: undefined,
+    source: undefined,
+  };
 }
 
 function ActivityRow({
@@ -578,6 +659,7 @@ function ActivityRow({
   hasProjectScope,
   showAllProjects,
   isPristine = false,
+  conflictsWithEarlierRow = false,
   onShowAllProjectsChange,
   onConjunctionChange,
   onChange,
@@ -595,7 +677,12 @@ function ActivityRow({
     [protocols, showArchived],
   );
 
-  // Pin a "Recently used" group at the top once the list is large enough.
+  const endpointsById = useMemo(
+    () => new Map(fullProtocols.map((p) => [p.id, endpointLabels(p)])),
+    [fullProtocols],
+  );
+
+  // Pin a "Recently run" group at the top once the list is large enough.
   // Server returns rows already sorted by last_run_date desc; use that order.
   const { recents, others, hasRecents } = useMemo(() => {
     const withRuns = visibleProtocols.filter((p) => p.last_run_date !== null);
@@ -627,18 +714,7 @@ function ActivityRow({
   const hasProtocol = criterion.protocol_id !== "";
 
   function pickProtocol(next: string | null) {
-    // The where-option vocabulary differs between a specific protocol and
-    // "any", so crossing that line resets the where-list; run scope is
-    // per-protocol and always drops on "any".
-    const crossed = (criterion.protocol_id === null) !== (next === null);
-    onChange({
-      ...criterion,
-      protocol_id: next,
-      where: crossed ? [] : criterion.where,
-      run_scope: next === null ? undefined : criterion.run_scope,
-      readout_definition_id: undefined,
-      source: undefined,
-    });
+    onChange(pickProtocolCriterion(criterion, next));
     setProtocolOpen(false);
   }
   // Pristine rows don't surface validation — the row is a passive
@@ -670,16 +746,19 @@ function ActivityRow({
             </SelectContent>
           </Select>
         )}
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          className="ml-auto size-6 text-muted-foreground hover:text-destructive"
-          onClick={onRemove}
-          aria-label={`Remove assay ${index + 1}`}
-        >
-          <Minus className="size-3.5" />
-        </Button>
+        {onRemove && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            className="ml-auto size-6 text-muted-foreground hover:text-destructive"
+            onClick={onRemove}
+            aria-label={`Remove assay ${index + 1}`}
+            title={`Remove assay ${index + 1}`}
+          >
+            <X className="size-3.5" />
+          </Button>
+        )}
       </div>
       <div className="flex min-w-0 items-center gap-2">
         {/* Protocol picker (rich rows: status dot + name + target + run stats) */}
@@ -718,8 +797,15 @@ function ActivityRow({
               <ChevronsUpDown className="h-3 w-3 shrink-0 opacity-50" />
             </button>
           </PopoverTrigger>
-          <PopoverContent className="p-0 w-[28rem] max-w-[calc(100vw-2rem)]" align="start">
+          {/* As wide as the field and as tall as the screen allows, so full
+              protocol names fit and more of the list is visible at once. */}
+          <PopoverContent
+            className="flex max-h-(--radix-popover-content-available-height) w-[max(28rem,var(--radix-popover-trigger-width))] max-w-[calc(100vw-2rem)] flex-col p-0"
+            align="start"
+            collisionPadding={16}
+          >
             <Command
+              className="min-h-0"
               filter={(value, search) => {
                 // Match by name + target + status; case-insensitive substring.
                 const haystack = value.toLowerCase();
@@ -729,7 +815,7 @@ function ActivityRow({
               }}
             >
               <CommandInput placeholder="Search protocols, targets…" className="h-8 text-sm" />
-              <CommandList className="max-h-96">
+              <CommandList className="max-h-none min-h-0 flex-1">
                 <CommandEmpty>No protocols found.</CommandEmpty>
 
                 <CommandGroup>
@@ -754,11 +840,12 @@ function ActivityRow({
 
                 {hasRecents && (
                   <>
-                    <CommandGroup heading="Recently used">
+                    <CommandGroup heading="Recently run">
                       {recents.map((p) => (
                         <ProtocolRow
                           key={p.id}
                           protocol={p}
+                          endpoints={endpointsById.get(p.id) ?? []}
                           selected={criterion.protocol_id === p.id}
                           onPick={() => pickProtocol(p.id)}
                         />
@@ -773,45 +860,47 @@ function ActivityRow({
                     <ProtocolRow
                       key={p.id}
                       protocol={p}
+                      endpoints={endpointsById.get(p.id) ?? []}
                       selected={criterion.protocol_id === p.id}
                       onPick={() => pickProtocol(p.id)}
                     />
                   ))}
                 </CommandGroup>
+              </CommandList>
 
-                <div className="flex flex-col gap-1.5 border-t border-border px-3 py-2 text-xs text-muted-foreground">
+              {/* Pinned below the list so the toggles stay in sight. */}
+              <div className="flex flex-col gap-1.5 border-t border-border px-3 py-2 text-xs text-muted-foreground">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id={`protocol-show-archived-${index}`}
+                    checked={showArchived}
+                    onCheckedChange={(v) => setShowArchived(v === true)}
+                    className="h-3.5 w-3.5"
+                  />
+                  <label
+                    htmlFor={`protocol-show-archived-${index}`}
+                    className="cursor-pointer select-none"
+                  >
+                    Show archived / retired
+                  </label>
+                </div>
+                {hasProjectScope && (
                   <div className="flex items-center gap-2">
                     <Checkbox
-                      id={`protocol-show-archived-${index}`}
-                      checked={showArchived}
-                      onCheckedChange={(v) => setShowArchived(v === true)}
+                      id={`protocol-show-all-${index}`}
+                      checked={showAllProjects}
+                      onCheckedChange={(v) => onShowAllProjectsChange(v === true)}
                       className="h-3.5 w-3.5"
                     />
                     <label
-                      htmlFor={`protocol-show-archived-${index}`}
+                      htmlFor={`protocol-show-all-${index}`}
                       className="cursor-pointer select-none"
                     >
-                      Show archived / retired
+                      Show all (across projects)
                     </label>
                   </div>
-                  {hasProjectScope && (
-                    <div className="flex items-center gap-2">
-                      <Checkbox
-                        id={`protocol-show-all-${index}`}
-                        checked={showAllProjects}
-                        onCheckedChange={(v) => onShowAllProjectsChange(v === true)}
-                        className="h-3.5 w-3.5"
-                      />
-                      <label
-                        htmlFor={`protocol-show-all-${index}`}
-                        className="cursor-pointer select-none"
-                      >
-                        Show all (across projects)
-                      </label>
-                    </div>
-                  )}
-                </div>
-              </CommandList>
+                )}
+              </div>
             </Command>
           </PopoverContent>
         </Popover>
@@ -819,12 +908,19 @@ function ActivityRow({
 
       {hasProtocol && (
         <div className="space-y-3">
-          {/* runs — per-protocol only; "Any protocol" has no run scope */}
+          {/* Filters first (runs, then endpoints), display last (split only
+              groups the result columns; it never changes which compounds
+              match). Runs are per-protocol only; "Any protocol" has none. */}
           {criterion.protocol_id !== null && (
             <RunScopePicker
               protocolId={criterion.protocol_id}
               value={criterion.run_scope}
-              onChange={(next: RunScope | undefined) => onChange({ ...criterion, run_scope: next })}
+              onChange={(next: RunScope | undefined) =>
+                onChange({ ...criterion, ...withRunScope(criterion.split, next) })
+              }
+              latestDisabledReason={
+                criterion.split?.by === "condition" ? LATEST_UNDER_CONDITION_SPLIT : undefined
+              }
             />
           )}
 
@@ -846,6 +942,23 @@ function ActivityRow({
               });
             }}
           />
+
+          {criterion.protocol_id !== null && (
+            <>
+              {/* split — optional side-by-side columns per run or condition */}
+              <SplitPicker
+                conditions={protocol?.condition_definitions ?? []}
+                split={criterion.split}
+                runScope={criterion.run_scope}
+                onChange={(next) => onChange({ ...criterion, ...next })}
+              />
+              {conflictsWithEarlierRow && (
+                <p className="text-xs text-destructive">
+                  This protocol already has a different run filter or split above.
+                </p>
+              )}
+            </>
+          )}
         </div>
       )}
 
@@ -880,14 +993,8 @@ export function ProtocolSection({
   // Pristine row: when criteria is empty we render one passive
   // placeholder row with the protocol picker ready, so the most common
   // search shape (`project + protocol + …`) is one click away instead of two.
-  // Dismissing the pristine row hides it for the rest of the session — until
-  // the user adds a real row and removes it again, at which point the
-  // "fresh start" intent re-shows the placeholder.
-  const [pristineDismissed, setPristineDismissed] = useState(false);
-  useEffect(() => {
-    if (criteria.length > 0) setPristineDismissed(false);
-  }, [criteria.length]);
-  const showPristine = criteria.length === 0 && !pristineDismissed;
+  // It has no remove of its own — the section's × removes the whole section.
+  const showPristine = criteria.length === 0;
   const hasProjectScope = projectIds.length > 0;
   // Renamed from `protocols` to avoid shadowing the `protocols: Protocol[]`
   // prop (full records) — this is the lighter ProtocolSummary[] list used
@@ -954,20 +1061,7 @@ export function ProtocolSection({
 
   return (
     <div className="space-y-2">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-sm font-semibold">Assay activity</h3>
-        {!showPristine && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="text-xs text-primary"
-            onClick={addTerm}
-          >
-            <Plus className="size-3.5" /> Add assay
-          </Button>
-        )}
-      </div>
+      <h3 className="text-sm font-semibold">Assay activity</h3>
       <p className="text-xs text-muted-foreground">
         An assay alone matches tested compounds. Add activity conditions to narrow by endpoints,
         such as IC50 &lt; 10 µM.
@@ -1007,18 +1101,6 @@ export function ProtocolSection({
         </div>
       )}
 
-      {/* Empty state — only when the user has explicitly dismissed the
-          pristine placeholder and there are no real rows. */}
-      {criteria.length === 0 && pristineDismissed && (
-        <button
-          type="button"
-          onClick={addTerm}
-          className="text-sm italic text-muted-foreground/60 hover:text-foreground transition-colors py-1"
-        >
-          + Add a protocol filter
-        </button>
-      )}
-
       {/* Pristine placeholder row — passive until the user picks a protocol. */}
       {showPristine && (
         <div className="space-y-3">
@@ -1037,7 +1119,6 @@ export function ProtocolSection({
               /* Conjunction is hidden on the first row; pristine never has siblings */
             }}
             onChange={commitPristine}
-            onRemove={() => setPristineDismissed(true)}
           />
         </div>
       )}
@@ -1049,6 +1130,7 @@ export function ProtocolSection({
             key={`activity-${i}`}
             index={i}
             criterion={c}
+            conflictsWithEarlierRow={conflictsWithEarlierRow(criteria, i)}
             conjunction={conjunctions[i] ?? "or"}
             protocols={protocolSummaries ?? []}
             fullProtocols={protocols}
@@ -1059,10 +1141,25 @@ export function ProtocolSection({
             onShowAllProjectsChange={setShowAllProjects}
             onConjunctionChange={(conj) => updateConjunction(i, conj)}
             onChange={(updated) => updateTerm(i, updated)}
-            onRemove={() => removeTerm(i)}
+            // The only assay has no × of its own: the section's × removes it.
+            onRemove={criteria.length > 1 ? () => removeTerm(i) : undefined}
           />
         ))}
       </div>
+
+      {/* After the last assay, where the eye is once one is finished — a
+          counter-screen or selectivity assay is added after the primary. */}
+      {criteria.length > 0 && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="text-xs text-primary"
+          onClick={addTerm}
+        >
+          <Plus className="size-3.5" /> Add another assay
+        </Button>
+      )}
     </div>
   );
 }

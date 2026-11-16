@@ -25,6 +25,7 @@ from cellar.domain.screening_assay.enums import (
     ReadoutDataType,
     ReadoutNormalization,
 )
+from cellar.domain.screening_assay.melt_window import MeltReadoutConfig
 from cellar.domain.screening_assay.protocol import (
     ConditionDefinition,
     Protocol,
@@ -47,11 +48,13 @@ from cellar.domain.screening_assay.target import EffectiveTarget, TargetRef
 from cellar.domain.shared.enums import ConcentrationUnit
 from cellar.domain.shared.hit_criterion import HitCriterion
 from cellar.domain.shared.ontology import OntologyTerm
+from cellar.infrastructure.persistence.sqlalchemy._sql import any_id
 from cellar.infrastructure.persistence.sqlalchemy.base_repository import (
     SQLAlchemyRepository,
 )
 from cellar.infrastructure.persistence.sqlalchemy.screening_assay.models import (
     ConditionDefinitionModel,
+    MeasuredCurveModel,
     ProtocolAliasModel,
     ProtocolModel,
     ReadoutDefinitionModel,
@@ -461,6 +464,23 @@ class SQLAlchemyProtocolRepository(SQLAlchemyRepository[Protocol, ProtocolModel]
         result = await self._session.execute(stmt)
         return [self._to_domain_tracked(m) for m in result.scalars().all()]
 
+    async def find_ids_by_readout_definition_ids(
+        self, workspace_id: uuid.UUID, readout_definition_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, uuid.UUID]:
+        """``{readout_definition_id: protocol_id}`` for the workspace's readout
+        definitions among ``readout_definition_ids``; others are dropped."""
+        if not readout_definition_ids:
+            return {}
+        stmt = (
+            select(ReadoutDefinitionModel.id, ReadoutDefinitionModel.protocol_id)
+            .join(ProtocolModel, ReadoutDefinitionModel.protocol_id == ProtocolModel.id)
+            .where(
+                ProtocolModel.workspace_id == workspace_id,
+                any_id(ReadoutDefinitionModel.id, readout_definition_ids),
+            )
+        )
+        return {rd_id: p_id for rd_id, p_id in (await self._session.execute(stmt)).all()}
+
     async def find_usages(self, workspace_id: uuid.UUID, protocol_id: uuid.UUID) -> list[str]:
         """Every row that still points at the protocol and would not go with it.
 
@@ -812,6 +832,25 @@ class SQLAlchemyProtocolRepository(SQLAlchemyRepository[Protocol, ProtocolModel]
         out.sort(key=lambda e: e.name.lower())
         return out
 
+    async def find_ids_with_measured_curves(
+        self, workspace_id: uuid.UUID, protocol_ids: list[uuid.UUID]
+    ) -> set[uuid.UUID]:
+        if not protocol_ids:
+            return set()
+        rows = await self._session.execute(
+            select(RunModel.protocol_id)
+            .distinct()
+            .where(
+                RunModel.workspace_id == workspace_id,
+                RunModel.protocol_id.in_(protocol_ids),
+                sa.exists().where(
+                    MeasuredCurveModel.run_id == RunModel.id,
+                    MeasuredCurveModel.workspace_id == workspace_id,
+                ),
+            )
+        )
+        return set(rows.scalars().all())
+
     async def find_effective_targets_for_protocols(
         self, workspace_id: uuid.UUID, protocol_ids: list[uuid.UUID]
     ) -> dict[uuid.UUID, list[TargetRef]]:
@@ -899,6 +938,9 @@ class SQLAlchemyProtocolRepository(SQLAlchemyRepository[Protocol, ProtocolModel]
                 pick_list_values=rd.pick_list_values,
                 dose_response_config=self._reconstruct_dose_response_config(
                     rd.dose_response_config
+                ),
+                melt_config=(
+                    MeltReadoutConfig.from_dict(rd.melt_config) if rd.melt_config else None
                 ),
                 created_at=rd.created_at,
                 updated_at=rd.updated_at,
@@ -1127,6 +1169,7 @@ class SQLAlchemyProtocolRepository(SQLAlchemyRepository[Protocol, ProtocolModel]
                 [v.to_dict() for v in rd.pick_list_values] if rd.pick_list_values else None
             ),
             dose_response_config=dose_response_dict,
+            melt_config=rd.melt_config.to_dict() if rd.melt_config is not None else None,
         )
 
     @staticmethod

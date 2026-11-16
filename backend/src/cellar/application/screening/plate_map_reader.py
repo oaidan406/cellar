@@ -22,6 +22,7 @@ class WellMapEntry:
     batch_number: str | None = None
     molecule_id: uuid.UUID | None = None
     molecule_name: str | None = None
+    registration_number: str | None = None
     # Custom-type identifiers (synonyms / common names) for the molecule.
     synonyms: tuple[str, ...] = ()
     # SMILES for the molecule, used by the well tooltip to render a
@@ -29,6 +30,12 @@ class WellMapEntry:
     smiles: str | None = None
     # Dose value in the protocol's dose_unit. Unit not carried per-well.
     dose: float | None = None
+    # Free-text sample name recorded for the position.
+    label: str | None = None
+    # Display label for the position, from the holder kind (see domain ``holder``).
+    position_label: str = ""
+    # Free-text bench observation about the position.
+    note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +59,12 @@ class PlateMapData:
     registered_plate_id: uuid.UUID | None = None
     registered_plate_barcode: str | None = None
     registered_plate_label: str | None = None
+    # What holds the positions, and its full size when known (empty for legacy plates).
+    holder_kind: str = "plate"
+    holder_rows: int | None = None
+    holder_columns: int | None = None
+    # How the holder is named for display (see domain ``holder.holder_label``).
+    holder_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -61,6 +74,7 @@ class PlateMapResult:
     # to UI consumers (plate map, readout-data table, dose-response chart).
     dose_unit: str
     plates: list[PlateMapData]
+    has_measured_curves: bool = False
 
 
 @runtime_checkable

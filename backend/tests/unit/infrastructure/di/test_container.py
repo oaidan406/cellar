@@ -6,7 +6,10 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from cellar.application.audit.audit_recording_service import AuditRecordingService
+from cellar.application.screening.instrument_export import InstrumentReaders
+from cellar.application.screening.readout_calculation_engine import ReadoutCalculationEngine
 from cellar.infrastructure.di.container import create_container
+from cellar.infrastructure.instrument_readers import default_readers
 from cellar.infrastructure.messaging.event_dispatcher import EventDispatcher
 from cellar.infrastructure.persistence.settings import DatabaseSettings
 from cellar.infrastructure.persistence.unit_of_work import AsyncUnitOfWork
@@ -67,3 +70,15 @@ class TestContainer:
         container = create_container(test_settings)
         service = container[AuditRecordingService]
         assert isinstance(service, AuditRecordingService)
+
+    def test_resolves_instrument_readers(self, test_settings: DatabaseSettings) -> None:
+        readers = create_container(test_settings)[InstrumentReaders]
+        assert [r.id for r in readers] == [r.id for r in default_readers()]
+        assert len(readers) >= 1
+
+    def test_calculation_engine_gets_melting_steps_and_batches(
+        self, test_settings: DatabaseSettings
+    ) -> None:
+        engine = create_container(test_settings)[ReadoutCalculationEngine]
+        assert engine._melting_step_repo is not None
+        assert engine._batch_repo is not None

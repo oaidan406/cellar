@@ -32,6 +32,7 @@ import {
   Copy,
   FlaskConical,
   LayoutDashboard,
+  LineChart,
   Lock,
   LockOpen,
   Paperclip,
@@ -60,7 +61,7 @@ import type { Protocol, ProtocolStatus } from "../types";
 import { CorrectProtocolDialog } from "./correct-protocol-dialog";
 import { CreateProtocolDialog } from "./create-protocol-dialog";
 import { CreateRunDialog } from "./create-run-dialog";
-import { ActivityTab, DesignTab, FilesTab, OverviewTab, RunsTab } from "./detail-tabs";
+import { ActivityTab, CurvesTab, DesignTab, FilesTab, OverviewTab, RunsTab } from "./detail-tabs";
 import { DiscriminatorInput } from "./discriminator-input";
 import { ProtocolCategoryInput } from "./protocol-category-input";
 import { ProtocolNamePreview, useRequiredNameSlots } from "./protocol-name-preview";
@@ -86,12 +87,17 @@ export function ProtocolDetail({ protocolId }: ProtocolDetailProps) {
   const lockMutation = useLockProtocol();
   const unlockMutation = useUnlockProtocol();
 
-  const [activeTab, setActiveTab] = useHashTab("overview");
+  const [hashTab, setActiveTab] = useHashTab("overview");
+  // The Curves tab exists only on a protocol with measured curves; a hash naming
+  // it elsewhere shows the overview.
+  const hasCurves = protocol?.has_measured_curves === true;
+  const activeTab = hashTab === "curves" && !hasCurves ? "overview" : hashTab;
+  // The runs chosen on the Curves tab, held here so the Runs tab can set them.
+  const [curveRunIds, setCurveRunIds] = useState<string[]>([]);
 
   const [createRunOpen, setCreateRunOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
-  const [editDescription, setEditDescription] = useState("");
   const [editCategory, setEditCategory] = useState("");
   const [editDiscriminator, setEditDiscriminator] = useState("");
   const [lockOpen, setLockOpen] = useState(false);
@@ -104,7 +110,6 @@ export function ProtocolDetail({ protocolId }: ProtocolDetailProps) {
   const query = { data: protocol, isLoading };
 
   const openEditDetails = (p: Protocol) => {
-    setEditDescription(p.description ?? "");
     setEditCategory(p.category ?? "");
     setEditDiscriminator(p.discriminator ?? "");
     setEditOpen(true);
@@ -341,6 +346,12 @@ export function ProtocolDetail({ protocolId }: ProtocolDetailProps) {
                 <FlaskConical className="mr-1.5 h-4 w-4" />
                 Runs
               </TabsTrigger>
+              {hasCurves && (
+                <TabsTrigger value="curves">
+                  <LineChart className="mr-1.5 h-4 w-4" />
+                  Compare traces
+                </TabsTrigger>
+              )}
               <TabsTrigger value="files">
                 <Paperclip className="mr-1.5 h-4 w-4" />
                 Files
@@ -362,8 +373,24 @@ export function ProtocolDetail({ protocolId }: ProtocolDetailProps) {
               <DesignTab protocol={protocol} protocolId={protocolId} />
             </TabsContent>
             <TabsContent value="runs">
-              <RunsTab protocol={protocol} protocolId={protocolId} />
+              <RunsTab
+                protocol={protocol}
+                protocolId={protocolId}
+                onCompareCurves={(ids) => {
+                  setCurveRunIds(ids);
+                  setActiveTab("curves");
+                }}
+              />
             </TabsContent>
+            {hasCurves && (
+              <TabsContent value="curves">
+                <CurvesTab
+                  protocolId={protocolId}
+                  runIds={curveRunIds}
+                  onRunIdsChange={setCurveRunIds}
+                />
+              </TabsContent>
+            )}
             <TabsContent value="files">
               <FilesTab protocolId={protocolId} />
             </TabsContent>
@@ -450,24 +477,17 @@ export function ProtocolDetail({ protocolId }: ProtocolDetailProps) {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Edit Protocol</DialogTitle>
-            <DialogDescription>Update this draft protocol&apos;s metadata.</DialogDescription>
+            <DialogDescription>
+              The facts its name comes from. The method is edited on the Overview.
+            </DialogDescription>
           </DialogHeader>
           <div className="grid gap-4 py-4">
-            <div className="grid gap-2">
-              <Label>Description</Label>
-              <Textarea
-                value={editDescription}
-                onChange={(e) => setEditDescription(e.target.value)}
-                placeholder="Optional — describe the assay procedure, controls, and acceptance criteria"
-                rows={4}
-              />
-            </div>
             <div className="grid gap-2">
               <Label>Category</Label>
               <ProtocolCategoryInput value={editCategory} onChange={setEditCategory} />
             </div>
             <div className="grid gap-2">
-              <Label>Discriminator{editNeeds.has("discriminator") ? "" : " (optional)"}</Label>
+              <Label>Distinguished by{editNeeds.has("discriminator") ? "" : " (optional)"}</Label>
               <DiscriminatorInput
                 value={editDiscriminator}
                 onChange={setEditDiscriminator}
@@ -485,7 +505,6 @@ export function ProtocolDetail({ protocolId }: ProtocolDetailProps) {
               onClick={() => {
                 updateMutation.mutate(
                   {
-                    description: editDescription || null,
                     category: editCategory || null,
                     discriminator: editDiscriminator.trim() || null,
                   },

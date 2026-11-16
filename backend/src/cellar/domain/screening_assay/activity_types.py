@@ -9,10 +9,68 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from cellar.domain.screening_assay.aggregation_types import AggregateStats
+
+
+@dataclass(frozen=True)
+class ReplicateStats:
+    """One run's replicate wells for one (molecule, readout, normalization).
+
+    ``eq_*`` summarise the unqualified values; ``gt_*`` / ``lt_*`` the values
+    reported as ``>``/``>=`` and ``<``/``<=`` (their bounds). The SQL layer
+    only counts and summarises; ``run_aggregation.combine_replicates`` holds
+    the rule that turns these into the run's value.
+    """
+
+    eq_count: int
+    eq_mean: float | None
+    eq_median: float | None
+    eq_min: float | None
+    eq_max: float | None
+    eq_geomean: float | None  # over unqualified values > 0
+    gt_count: int
+    gt_max_bound: float | None
+    lt_count: int
+    lt_min_bound: float | None
+
+
+@dataclass(frozen=True)
+class RunReadoutStats:
+    """Replicate summary for one (molecule, readout, normalization, run).
+
+    Rejected runs and outlier wells never appear. ``unit``, ``aggregation``
+    and ``readout_name`` are the readout definition's.
+    """
+
+    molecule_id: uuid.UUID
+    readout_definition_id: uuid.UUID
+    normalization: str | None
+    run_id: uuid.UUID
+    run_date: date | None
+    run_status: str
+    protocol_id: uuid.UUID
+    unit: str | None
+    aggregation: str
+    readout_name: str
+    stats: ReplicateStats
+
+
+@dataclass(frozen=True)
+class RunHeader:
+    """A run's identity and labels without its plates and wells."""
+
+    id: uuid.UUID
+    protocol_id: uuid.UUID
+    run_date: date | None
+    created_at: datetime | None
+    status: str
+    operator: uuid.UUID | None
+    notes: str | None
+    conditions: dict[str, Any] | None
+    plate_barcodes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -56,7 +114,7 @@ class RunSummary:
 
     run_id: uuid.UUID
     run_date: date
-    curve_id: uuid.UUID
+    curve_id: uuid.UUID | None  # None for single-point and reported values
     curve_class: str | None
     r_squared: float | None
     intercept_values: list[dict[str, Any]]
@@ -114,6 +172,12 @@ class ActivityValue:
     # *extras* needed for an aggregate overlay. None on non-aggregate rules.
     additional_curves: list[dict[str, Any]] | None = None
     aggregate: dict[str, Any] | None = None
+    # ---- the cell's run set, for surfaces that draw its curves ----
+    # The curve the cell's value comes from (None for single-point and
+    # reported values) and every in-scope run that was a candidate, newest
+    # first — so the detail drawer never re-derives the selection itself.
+    representative_curve_id: uuid.UUID | None = None
+    run_ids: list[uuid.UUID] | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +211,33 @@ class AnyProtocolActivity:
 
 
 @dataclass(frozen=True)
+class ReadoutSummary:
+    """A plain (non-dose-response) readout of one molecule on one protocol, across its runs."""
+
+    readout_definition_id: uuid.UUID
+    readout_name: str
+    value: float  # the value that stands for the molecule (see readout_best)
+    qualifier: str  # "=", ">" or "<"
+    unit: str | None
+    data_point_count: int
+    run_count: int
+    draft_run_count: int  # runs not yet completed or approved
+    # How ``value`` was chosen from the runs' values: "high", "low" or
+    # "magnitude" (the largest shift in either direction).
+    best_direction: str = "high"
+
+
+@dataclass(frozen=True)
+class RunLink:
+    """A run of the protocol that holds data for the molecule."""
+
+    run_id: uuid.UUID
+    run_date: date
+    status: str
+    notes: str | None = None  # the run's own description; tells same-day runs apart
+
+
+@dataclass(frozen=True)
 class ProtocolActivitySummary:
     """Activity summary for one protocol on one molecule."""
 
@@ -162,6 +253,16 @@ class ProtocolActivitySummary:
     # per-Card dynamic column set on the molecule activity tab. Empty when
     # the protocol's DR readouts declare no explicit intercepts.
     intercepts: list[dict[str, Any]] = field(default_factory=list)
+    # Plain readouts (Tm, ΔTm, a single-point % inhibition, ...), in protocol order.
+    plain_readouts: list[ReadoutSummary] = field(default_factory=list)
+    # The protocol's recommended hit rule applied to this molecule; None without one.
+    hit: bool | None = None
+    hit_criteria: list[dict[str, Any]] = field(default_factory=list)
+    protocol_code: str | None = None
+    # Newest first: where a chemist checks the values (traces, curves).
+    runs: list[RunLink] = field(default_factory=list)
+    # The run tab that shows these results: "curves" (traces) or "dose-response".
+    results_tab: str | None = None
 
 
 @dataclass(frozen=True)

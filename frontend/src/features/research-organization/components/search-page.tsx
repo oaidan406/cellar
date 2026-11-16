@@ -2,6 +2,7 @@
 
 import type { Molecule } from "@/features/chemical-registration/types";
 import { consumeScaffoldSearch } from "@/features/research-organization/lib/scaffold-search-handoff";
+import { CompoundCurvesProvider } from "@/features/screening-assay/components/compound-curves-dialog";
 import { useProtocols } from "@/features/screening-assay/hooks/use-protocols";
 import { useTags } from "@/features/tagging/hooks/use-tags";
 import { CollectionPickerDialog } from "@/shared/components/collection-picker-dialog";
@@ -12,10 +13,15 @@ import { useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useCollections } from "../hooks/use-collections";
 import { useProjects } from "../hooks/use-projects";
+import { type RecentSearch, useRecordRecentSearch } from "../hooks/use-recent-searches";
 import { useReportConfig } from "../hooks/use-report-config";
 import { useSavedSearches } from "../hooks/use-saved-searches";
 import { type EnrichedSearchResponse, useExecuteSearch } from "../hooks/use-search";
-import { toBackendProtocolColumns, uniqueProtocolIds } from "../lib/protocol-column-id";
+import {
+  hasOverlayablePlots,
+  toBackendProtocolColumns,
+  uniqueProtocolIds,
+} from "../lib/protocol-column-id";
 import {
   AGGREGATION_LABELS,
   aggregationModeToWire,
@@ -26,6 +32,7 @@ import {
 import type { AggregationMode } from "../lib/use-aggregation-mode";
 import {
   type ActivityValue,
+  type ProtocolColumnGroups,
   type SavedSearch,
   type SearchQuery,
   type SortDir,
@@ -34,7 +41,13 @@ import {
 } from "../types";
 import { CompoundComparison } from "./search/compound-comparison";
 import { CompoundDetailSheet } from "./search/compound-detail-sheet";
-import { QuerySummary, searchQueryKey, structureQuery } from "./search/query-summary";
+import {
+  QuerySummary,
+  querySummaryText,
+  searchQueryKey,
+  structureQuery,
+} from "./search/query-summary";
+import { RecentSearchesMenu, storedCriteria } from "./search/recent-searches-menu";
 import { ReportCustomizer } from "./search/report-customizer";
 import { ResultsGrid } from "./search/results-grid";
 import {
@@ -60,9 +73,14 @@ interface SearchState {
   results: EnrichedMolecule[];
   nextCursor: string | null;
   totalCount: number | null;
+  /** Split protocols' column groups — the same on every page of a search. */
+  columnGroups: Record<string, ProtocolColumnGroups> | null;
   hasSearched: boolean;
   selectedMolecule: EnrichedMolecule | null;
   selectedIndex: number;
+  /** The grid column the drawer was opened from; it opens a split protocol on
+   *  that column's group and keeps it while stepping through compounds. */
+  focusColumn: string | null;
   sortBy: SortField | undefined;
   sortDir: SortDir;
   gridSelectedIds: Set<string>;
@@ -81,6 +99,7 @@ type SearchAction =
       results: EnrichedMolecule[];
       nextCursor: string | null;
       totalCount: number | null;
+      columnGroups: Record<string, ProtocolColumnGroups> | null;
     }
   | {
       type: "loadMoreComplete";
@@ -90,7 +109,7 @@ type SearchAction =
     }
   | { type: "setSort"; sortBy: SortField | undefined; sortDir: SortDir }
   | { type: "setGridSelection"; ids: Set<string> }
-  | { type: "select"; molecule: EnrichedMolecule; index: number }
+  | { type: "select"; molecule: EnrichedMolecule; index: number; column: string | null }
   | { type: "navigate"; index: number; molecule: EnrichedMolecule | null }
   | { type: "clearSelection" };
 
@@ -101,9 +120,11 @@ const initialSearchState: SearchState = {
   results: [],
   nextCursor: null,
   totalCount: null,
+  columnGroups: null,
   hasSearched: false,
   selectedMolecule: null,
   selectedIndex: 0,
+  focusColumn: null,
   sortBy: undefined,
   sortDir: "asc",
   gridSelectedIds: new Set(),
@@ -129,6 +150,7 @@ function searchReducer(state: SearchState, action: SearchAction): SearchState {
         results: action.results,
         nextCursor: action.nextCursor,
         totalCount: action.totalCount,
+        columnGroups: action.columnGroups,
       };
     case "loadMoreComplete":
       return {
@@ -142,7 +164,12 @@ function searchReducer(state: SearchState, action: SearchAction): SearchState {
     case "setGridSelection":
       return { ...state, gridSelectedIds: action.ids };
     case "select":
-      return { ...state, selectedMolecule: action.molecule, selectedIndex: action.index };
+      return {
+        ...state,
+        selectedMolecule: action.molecule,
+        selectedIndex: action.index,
+        focusColumn: action.column,
+      };
     case "navigate":
       return {
         ...state,
@@ -157,6 +184,35 @@ function searchReducer(state: SearchState, action: SearchAction): SearchState {
 }
 
 // ─── Inner component (uses useSearchParams, needs Suspense boundary) ───────
+
+/** A stored search (saved or recent), staged to reload into the page. */
+type PendingSavedSearchLoad = {
+  query: SearchQuery;
+  aggregationMode: AggregationMode;
+  protocolColumns: string[];
+  columnsBlob: Record<string, unknown> | null;
+};
+
+/** Decode a stored search's `query` + `columns` (the shape the Save dialog and
+ *  recent searches both write). The aggregation rule rides inside the stored
+ *  query (Task 14); older saved searches lack it and fall back to "latest",
+ *  the FE default. It is stripped before the query goes to the BE, where it
+ *  travels as a top-level `input.aggregation`. */
+function decodeStoredSearch(
+  rawQuery: Record<string, unknown>,
+  columns: Record<string, unknown> | null | undefined,
+): PendingSavedSearchLoad | null {
+  const storedAggregation = rawQuery?.aggregation;
+  const query = storedCriteria(rawQuery);
+  if (!query?.criteria) return null;
+  return {
+    query,
+    aggregationMode:
+      typeof storedAggregation === "string" ? wireToAggregationMode(storedAggregation) : "latest",
+    protocolColumns: (columns as { protocolColumns?: string[] } | null)?.protocolColumns ?? [],
+    columnsBlob: columns ?? null,
+  };
+}
 
 function SearchPageInner() {
   const searchParams = useSearchParams();
@@ -187,9 +243,11 @@ function SearchPageInner() {
       results,
       nextCursor,
       totalCount,
+      columnGroups,
       hasSearched,
       selectedMolecule,
       selectedIndex,
+      focusColumn,
       sortBy,
       sortDir,
       gridSelectedIds,
@@ -226,6 +284,11 @@ function SearchPageInner() {
     draftQuery.current = query;
   }, []);
   const { config: reportConfig, loadFromSavedSearch } = useReportConfig();
+  // Read at completion, so a search records the table set-up it ran with
+  // without re-creating executeRequest on every customizer change.
+  const reportConfigRef = useRef(reportConfig);
+  reportConfigRef.current = reportConfig;
+  const recordRecentSearch = useRecordRecentSearch();
   // URL-synced aggregation mode. The toolbar's <AggregationControl /> owns
   // the writer; the page reads + injects into the request body, and also
   // calls `setMode` on the saved-search load path so the URL chip and the
@@ -286,13 +349,21 @@ function SearchPageInner() {
   // Commit rows and their query together. Request versions also invalidate
   // responses after Reset or a newer search, including saved-search handoffs.
   const { mutateAsync } = searchMutation;
+  // The sort the last request ran with; header clicks re-run when it changes.
+  const previousSortRef = useRef({ sortBy, sortDir });
   const executeRequest = useCallback(
     function run(
       query: SearchQuery,
       columns: string[],
       mode: AggregationMode,
-      options: { cursor?: string; collapse?: boolean } = {},
+      options: {
+        cursor?: string;
+        collapse?: boolean;
+        /** Overrides the current sort (an explicit "unsorted" included). */
+        sort?: { sortBy: SortField | undefined; sortDir: SortDir };
+      } = {},
     ) {
+      const sort = options.sort ?? { sortBy, sortDir };
       const version = ++requestVersion.current;
       const startingDraft = draftQuery.current ? searchQueryKey(draftQuery.current) : null;
       setSearchPending(true);
@@ -311,8 +382,8 @@ function SearchPageInner() {
         },
         limit: SEARCH_PAGE_SIZE,
         cursor: options.cursor,
-        sort_by: sortBy,
-        sort_dir: sortDir,
+        sort_by: sort.sortBy,
+        sort_dir: sort.sortDir,
       })
         .then((data) => {
           if (version !== requestVersion.current) return;
@@ -322,14 +393,28 @@ function SearchPageInner() {
             totalCount: data.total_count ?? null,
           };
           if (options.cursor) dispatch({ type: "loadMoreComplete", ...payload });
-          else
+          else {
             dispatch({
               type: "searchComplete",
               query,
               protocolColumns: columns,
               aggregation: mode,
+              columnGroups: data.column_groups ?? null,
               ...payload,
             });
+            // Into the user's recent searches, in the shape a saved search
+            // stores (so either reloads the same way). Running it again —
+            // re-sorted, re-summarised — moves it to the top, not a new row.
+            if (query.criteria.length > 0)
+              recordRecentSearch({
+                query: {
+                  ...(query as unknown as Record<string, unknown>),
+                  aggregation: aggregationModeToWire(mode),
+                },
+                columns: { reportConfig: reportConfigRef.current, protocolColumns: columns },
+                result_count: data.total_count ?? null,
+              });
+          }
           if (
             options.collapse &&
             (!draftQuery.current ||
@@ -341,6 +426,29 @@ function SearchPageInner() {
         })
         .catch((error: unknown) => {
           if (version !== requestVersion.current) return;
+          // A ranked page's cursor row vanished (data changed since page 1):
+          // the ranking is stale, so start the search over.
+          if (
+            options.cursor &&
+            error instanceof Error &&
+            error.message.includes("run the search again")
+          ) {
+            run(query, columns, mode, {});
+            return;
+          }
+          // The new search no longer has the column the grid was sorted by:
+          // drop the sort and run it in the default order.
+          if (
+            sort.sortBy &&
+            error instanceof Error &&
+            error.message.includes("Unknown sort column")
+          ) {
+            const unsorted = { sortBy: undefined, sortDir: "asc" as SortDir };
+            previousSortRef.current = unsorted;
+            dispatch({ type: "setSort", ...unsorted });
+            run(query, columns, mode, { ...options, sort: unsorted });
+            return;
+          }
           setSearchError(
             error instanceof Error
               ? error.message.replace(/^API error: \d+ — /, "")
@@ -351,7 +459,7 @@ function SearchPageInner() {
           if (version === requestVersion.current) setSearchPending(false);
         });
     },
-    [mutateAsync, sortBy, sortDir, enrichItems],
+    [mutateAsync, sortBy, sortDir, enrichItems, recordRecentSearch],
   );
 
   const handleSearch = useCallback(
@@ -376,6 +484,17 @@ function SearchPageInner() {
     setReportColumns(next);
   }, []);
 
+  // A header click sorts the WHOLE result set on the server: re-run from page 1.
+  const handleSortChange = useCallback((next: SortField | undefined, dir: SortDir) => {
+    dispatch({ type: "setSort", sortBy: next, sortDir: dir });
+  }, []);
+  useEffect(() => {
+    const previous = previousSortRef.current;
+    if (previous.sortBy === sortBy && previous.sortDir === sortDir) return;
+    previousSortRef.current = { sortBy, sortDir };
+    if (currentQuery) executeRequest(currentQuery, protocolColumns, executedAggregation);
+  }, [sortBy, sortDir, currentQuery, protocolColumns, executedAggregation, executeRequest]);
+
   const previousAggregationModeRef = useRef(aggregationMode);
   useEffect(() => {
     if (previousAggregationModeRef.current === aggregationMode) return;
@@ -394,13 +513,6 @@ function SearchPageInner() {
   // mutation from a clean re-render cycle. The mutation goes through
   // `handleSearch` (the same path the chemist's Search button uses) so
   // the deps are always fresh.
-  type PendingSavedSearchLoad = {
-    query: SearchQuery;
-    aggregationMode: AggregationMode;
-    protocolColumns: string[];
-    columnsBlob: Record<string, unknown> | null;
-  };
-
   const [pendingSavedSearchLoad, setPendingSavedSearchLoad] =
     useState<PendingSavedSearchLoad | null>(null);
   const [loadedSavedSearchId, setLoadedSavedSearchId] = useState<string | null>(null);
@@ -418,31 +530,18 @@ function SearchPageInner() {
 
     const saved = savedSearches.find((s: SavedSearch) => s.id === savedSearchId);
     if (!saved) return;
-
-    const rawQuery = saved.query as Record<string, unknown>;
-    // The aggregation rule is co-located inside the saved `query` blob
-    // (Task 14). Old saved searches (pre-Task 14) won't have this key
-    // and fall back to "latest" — matching the FE default.
-    const savedAggregation = rawQuery?.aggregation;
-    const nextAggregationMode =
-      typeof savedAggregation === "string" ? wireToAggregationMode(savedAggregation) : "latest";
-    // Strip the aggregation field out before handing the query to the BE
-    // — the search query schema doesn't include it as a criterion (it
-    // travels as a top-level `input.aggregation` instead).
-    const { aggregation: _aggregation, ...queryWithoutAggregation } = rawQuery;
-    const query = queryWithoutAggregation as unknown as SearchQuery;
-    if (!query?.criteria) return;
-
-    const cols = saved.columns as { protocolColumns?: string[] } | null;
-    const restoredColumns = cols?.protocolColumns ?? [];
-
-    setPendingSavedSearchLoad({
-      query,
-      aggregationMode: nextAggregationMode,
-      protocolColumns: restoredColumns,
-      columnsBlob: saved.columns as Record<string, unknown> | null,
-    });
+    const load = decodeStoredSearch(
+      saved.query as Record<string, unknown>,
+      saved.columns as Record<string, unknown> | null,
+    );
+    if (load) setPendingSavedSearchLoad(load);
   }, [savedSearchId, savedSearches, loadedSavedSearchId, pendingSavedSearchLoad]);
+
+  // A picked recent search reloads through the same staged path as a saved one.
+  const handlePickRecent = useCallback((search: RecentSearch) => {
+    const load = decodeStoredSearch(search.query, search.columns);
+    if (load) setPendingSavedSearchLoad(load);
+  }, []);
 
   // FIRE: saved-search load — execute the staged search. Uses executeRequest
   // directly because saved searches carry their OWN
@@ -529,10 +628,20 @@ function SearchPageInner() {
           // property column whitelist, image size. The BE column builder
           // reads this and trims columns / sizes images accordingly.
           reportConfig,
+          // The line above the grid, which the PDF prints as its heading.
+          summary: querySummaryText(currentQuery, summaryContext),
         },
       };
     },
-    [currentQuery, protocolColumns, executedAggregation, sortBy, sortDir, reportConfig],
+    [
+      currentQuery,
+      protocolColumns,
+      executedAggregation,
+      sortBy,
+      sortDir,
+      reportConfig,
+      summaryContext,
+    ],
   );
 
   // ── Add to collection ──────────────────────────────────────────────────
@@ -543,9 +652,9 @@ function SearchPageInner() {
 
   // ── Row click -> detail panel ──────────────────────────────────────────
   const handleRowClick = useCallback(
-    (molecule: EnrichedMolecule) => {
+    (molecule: EnrichedMolecule, colId?: string) => {
       const idx = results.findIndex((m) => m.id === molecule.id);
-      dispatch({ type: "select", molecule, index: idx >= 0 ? idx : 0 });
+      dispatch({ type: "select", molecule, index: idx >= 0 ? idx : 0, column: colId ?? null });
     },
     [results],
   );
@@ -590,6 +699,13 @@ function SearchPageInner() {
           onCollapsedChange={setFiltersCollapsed}
           onDraftChange={onDraftChange}
           summaryContext={summaryContext}
+          headerActions={
+            <RecentSearchesMenu
+              currentQuery={currentQuery}
+              summaryContext={summaryContext}
+              onPick={handlePickRecent}
+            />
+          }
           protocols={protocols ?? []}
         />
 
@@ -630,6 +746,8 @@ function SearchPageInner() {
           <ResultsGrid
             results={results}
             protocolColumns={protocolColumns}
+            columnGroups={columnGroups}
+            onSortChange={handleSortChange}
             protocols={protocols ?? []}
             reportConfig={reportConfig}
             loading={searchPending && !currentQuery}
@@ -673,7 +791,7 @@ function SearchPageInner() {
                 scopeForcesSingleRun={scopeForcesSingleRun}
                 busy={searchPending}
                 hasAssays={protocolColumns.length > 0}
-                hasCurves={protocolColumns.some((column) => column.startsWith("drc:"))}
+                canOverlay={hasOverlayablePlots(protocolColumns, protocols ?? [], columnGroups)}
               />
             }
             selectionActions={
@@ -734,6 +852,7 @@ function SearchPageInner() {
           loading={searchPending}
           protocols={protocols ?? []}
           protocolColumns={protocolColumns}
+          columnGroups={columnGroups}
           mode={executedAggregation}
           onClose={() => setCompareOpen(false)}
         />
@@ -748,7 +867,8 @@ function SearchPageInner() {
         totalCount={results.length}
         onNavigate={handleDetailNavigate}
         onOpenChange={(open) => !open && dispatch({ type: "clearSelection" })}
-        currentQuery={currentQuery}
+        columnGroups={columnGroups}
+        focusColumn={focusColumn}
         aggregationMode={executedAggregation}
       />
 
@@ -796,7 +916,9 @@ export function SearchPage() {
         </div>
       }
     >
-      <SearchPageInner />
+      <CompoundCurvesProvider>
+        <SearchPageInner />
+      </CompoundCurvesProvider>
     </Suspense>
   );
 }

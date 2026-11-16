@@ -20,7 +20,7 @@ dependencies = [
     "lagom>=2.7.0",
     "returns>=0.23.0",
     # Auth
-    "duar-auth>=1.4.1",
+    "duar-auth>=2.0.0",
     "pyjwt[crypto]>=2.14.0",
     "httpx>=0.28.0",
     # Chemistry
@@ -38,6 +38,8 @@ dependencies = [
     "numpy>=2.0.0",
     "pandas>=2.2.0",
     "openpyxl>=3.1.0",
+    # openpyxl reads uploaded spreadsheets through defusedxml when it is installed.
+    "defusedxml>=0.7.1",
     "matplotlib>=3.9",
     "weasyprint>=62",
     "Jinja2>=3.1",

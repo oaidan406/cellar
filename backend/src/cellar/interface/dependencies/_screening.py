@@ -17,6 +17,7 @@ from cellar.application.screening.create_readout_data import CreateReadoutData
 from cellar.application.screening.create_run import CreateRun
 from cellar.application.screening.delete_compound_flag import DeleteCompoundFlag
 from cellar.application.screening.delete_run import DeleteRun
+from cellar.application.screening.find_curve_positions import FindCurvePositions
 from cellar.application.screening.find_similar_protocols import FindSimilarProtocols
 from cellar.application.screening.fit_dose_response import FitDoseResponseCurves
 from cellar.application.screening.get_collection_gap import (
@@ -26,6 +27,7 @@ from cellar.application.screening.get_collection_gap import (
 from cellar.application.screening.get_compound_curves import GetCompoundCurves
 from cellar.application.screening.get_curve_edit_history import GetCurveEditHistory
 from cellar.application.screening.get_dose_response import ListDoseResponseByRun
+from cellar.application.screening.get_measured_curves_batch import GetMeasuredCurvesBatch
 from cellar.application.screening.get_molecule_activity_detail import GetMoleculeActivityDetail
 from cellar.application.screening.get_molecule_test_counts import GetMoleculeTestCounts
 from cellar.application.screening.get_plate_map import GetPlateMap
@@ -34,6 +36,7 @@ from cellar.application.screening.get_protocol_activity import GetProtocolActivi
 from cellar.application.screening.get_protocol_stats import GetProtocolStats
 from cellar.application.screening.get_readout_data import ListReadoutDataByRun
 from cellar.application.screening.get_run import GetRun, ListRunsByProtocol
+from cellar.application.screening.get_run_curves import GetRunCurves
 from cellar.application.screening.get_target import GetTarget, ListTargets
 from cellar.application.screening.import_run_readouts import ImportRunReadouts
 from cellar.application.screening.import_summary_file import ImportSummaryFile
@@ -79,6 +82,7 @@ from cellar.application.screening.manage_protocol_references import (
 )
 from cellar.application.screening.manage_readout_definitions import (
     AddReadoutDefinition,
+    AddTemperatureWindow,
     RemoveReadoutDefinition,
     UpdateReadoutDefinition,
 )
@@ -135,6 +139,7 @@ from cellar.application.screening.set_run_hit_criteria import (
     ResetRunHitCriteria,
     SetRunHitCriteria,
 )
+from cellar.application.screening.suggest_from_method import SuggestFromMethod
 from cellar.application.screening.sync_targets import SyncTargetsFromProtCellar
 from cellar.application.screening.update_run import UpdateRun
 
@@ -149,6 +154,7 @@ __all__ = [
     "AddReadoutDefinitionDep",
     "AddRunCollectionDep",
     "AddRunTargetDep",
+    "AddTemperatureWindowDep",
     "ApproveRunDep",
     "BulkCreateReadoutDataDep",
     "ClassifyDoseResponseCurveDep",
@@ -169,10 +175,12 @@ __all__ = [
     "DeletePlateTemplateDep",
     "DeleteProtocolDep",
     "DeleteRunDep",
+    "FindCurvePositionsDep",
     "FindSimilarProtocolsDep",
     "FitDoseResponseCurvesDep",
     "GetCompoundCurvesDep",
     "GetCurveEditHistoryDep",
+    "GetMeasuredCurvesBatchDep",
     "GetMoleculeActivityDetailDep",
     "GetMoleculeTestCountsDep",
     "GetPlateMapDep",
@@ -184,6 +192,7 @@ __all__ = [
     "GetProtocolStatsDep",
     "GetProtocolTargetsDep",
     "GetRunCollectionGapDep",
+    "GetRunCurvesDep",
     "GetRunDep",
     "GetTargetDep",
     "ImportRunReadoutsDep",
@@ -241,6 +250,7 @@ __all__ = [
     "SetRunHitCriteriaDep",
     "SetUpRunPlateDep",
     "StartRunDep",
+    "SuggestFromMethodDep",
     "SyncTargetsDep",
     "UnlinkRunPlateDep",
     "UnlockProtocolDep",
@@ -303,6 +313,7 @@ GetProtocolCollectionGapDep = Annotated[
 ]
 UpdateProtocolDep = Annotated[UpdateProtocol, Depends(_get_use_case(UpdateProtocol))]
 ListNameFlagsDep = Annotated[ListNameFlags, Depends(_get_use_case(ListNameFlags))]
+SuggestFromMethodDep = Annotated[SuggestFromMethod, Depends(_get_use_case(SuggestFromMethod))]
 RederiveAllProtocolNamesDep = Annotated[
     RederiveAllProtocolNames, Depends(_get_use_case(RederiveAllProtocolNames))
 ]
@@ -335,6 +346,9 @@ RemoveReadoutDefinitionDep = Annotated[
 ]
 UpdateReadoutDefinitionDep = Annotated[
     UpdateReadoutDefinition, Depends(_get_use_case(UpdateReadoutDefinition))
+]
+AddTemperatureWindowDep = Annotated[
+    AddTemperatureWindow, Depends(_get_use_case(AddTemperatureWindow))
 ]
 AddConditionDefinitionDep = Annotated[
     AddConditionDefinition, Depends(_get_use_case(AddConditionDefinition))
@@ -428,6 +442,11 @@ ListDoseResponseEnrichedDep = Annotated[
     ListDoseResponseEnriched, Depends(_get_use_case(ListDoseResponseEnriched))
 ]
 GetPlateMapDep = Annotated[GetPlateMap, Depends(_get_use_case(GetPlateMap))]
+GetRunCurvesDep = Annotated[GetRunCurves, Depends(_get_use_case(GetRunCurves))]
+FindCurvePositionsDep = Annotated[FindCurvePositions, Depends(_get_use_case(FindCurvePositions))]
+GetMeasuredCurvesBatchDep = Annotated[
+    GetMeasuredCurvesBatch, Depends(_get_use_case(GetMeasuredCurvesBatch))
+]
 FindSimilarProtocolsDep = Annotated[
     FindSimilarProtocols, Depends(_get_use_case(FindSimilarProtocols))
 ]

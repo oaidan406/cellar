@@ -19,7 +19,12 @@ import pytest
 from cellar.application.screening.molecule_activity_service import (
     MoleculeActivityService,
 )
-from cellar.domain.screening_assay.activity_types import AggregatedReadout
+from cellar.domain.screening_assay.activity_types import (
+    AggregatedReadout,
+    ReplicateStats,
+    RunHeader,
+    RunReadoutStats,
+)
 from cellar.domain.screening_assay.aggregation_types import SelectionRule
 from cellar.domain.screening_assay.curve_fitting import InterceptValue
 from cellar.domain.screening_assay.dose_response_config import (
@@ -106,10 +111,11 @@ def _make_run(
     run_date: date,
     status: RunStatus = RunStatus.APPROVED,
     protocol_id: uuid.UUID = PROTO_ID,
+    notes: str | None = None,
 ) -> Run:
     """Build a Run aggregate suitable as a `find_by_ids` payload row.
 
-    Defaults to APPROVED so the aggregator's LATEST_APPROVED_RUN treats
+    Defaults to APPROVED so the aggregator's LATEST_RUN treats
     every seeded run as approved (matches the "all runs approved" common
     case in test scenarios). Override per-test when exercising mixed-status
     behavior.
@@ -121,6 +127,7 @@ def _make_run(
         run_date=run_date,
         operator=uuid.uuid4(),
         status=status,
+        notes=notes,
     )
 
 
@@ -188,21 +195,27 @@ def _make_service(curve_repo=None, run_repo=None, readout_repo=None) -> Molecule
     # find_by_ids returns [] by default — service falls back to "uM" for
     # IC50 unit decoration. Tests that need a specific unit should override.
     protocol_repo.find_by_ids = AsyncMock(return_value=[])
+    # Every readout-def in these tests belongs to PROTO_ID unless it is RD_B.
+    protocol_repo.find_ids_by_readout_definition_ids = AsyncMock(
+        side_effect=lambda ws, ids: {i: PROTO_B if i == RD_B else PROTO_ID for i in ids}
+    )
+    protocol_repo.find_effective_targets_for_protocols = AsyncMock(return_value={})
 
     if readout_repo is None:
         readout_repo = AsyncMock()
-        # Default: no raw-layer rows. Without this the bare AsyncMock would
-        # hand the reported-endpoint fallback a truthy mock instead of a dict
-        # (and a non-iterable mock instead of a row list).
+        # Default: no readout rows (and so no reported endpoints). The
+        # molecule page's activity summary still reads pooled aggregates.
+        readout_repo.find_run_stats = AsyncMock(return_value=[])
         readout_repo.find_aggregated_by_molecules = AsyncMock(return_value={})
+        readout_repo.find_readout_definitions_by_names = AsyncMock(return_value={})
         readout_repo.find_by_molecule = AsyncMock(return_value=[])
 
     if run_repo is None:
         run_repo = AsyncMock()
         # Default: no runs registered. Tests that exercise the DR path
         # must override this so `_build_resolved_runs` can adapt curves
-        # back to their owning Run (run_date + status).
-        run_repo.find_by_ids = AsyncMock(return_value={})
+        # back to their owning run (run_date + status).
+        run_repo.find_headers = AsyncMock(return_value={})
 
     return MoleculeActivityService(
         uow=_FakeUoW(),
@@ -220,14 +233,27 @@ def _curve_repo_for(curves: list[DoseResponseCurve]) -> AsyncMock:
     expected to pass curves already sorted by run_date desc.
     """
     repo = AsyncMock()
-    repo.find_all_curves_for_molecules = AsyncMock(
-        return_value={MOL_ID: {RD_ID: list(curves)}}
-    )
+    repo.find_all_curves_for_molecules = AsyncMock(return_value={MOL_ID: {RD_ID: list(curves)}})
     return repo
+
+
+def _header(run: Run) -> RunHeader:
+    return RunHeader(
+        id=run.id,
+        protocol_id=run.protocol_id,
+        run_date=run.run_date,
+        created_at=None,
+        status=run.status.value,
+        operator=run.operator,
+        notes=run.notes,
+        conditions=None,
+    )
 
 
 def _run_repo_for(runs: dict[uuid.UUID, Run]) -> AsyncMock:
     repo = AsyncMock()
+    # Search cells read run headers; the molecule page's summary reads runs.
+    repo.find_headers = AsyncMock(return_value={i: _header(r) for i, r in runs.items()})
     repo.find_by_ids = AsyncMock(return_value=dict(runs))
     return repo
 
@@ -294,7 +320,7 @@ class TestEnrichMoleculesWithCurveParams:
 
         # New multi-run context fields on a single-run cell
         assert av.run_count == 1
-        assert av.selection_rule == SelectionRule.LATEST_APPROVED_RUN.value
+        assert av.selection_rule == SelectionRule.LATEST_RUN.value
         assert av.runs is not None and len(av.runs) == 1
         assert av.disagreement_flag is False
 
@@ -475,129 +501,9 @@ class TestEnrichMoleculesEmptyInputs:
         assert result == {}
 
 
-class TestEnrichMoleculesReportedEndpointFallback:
-    """A DR column with no fitted curve falls back to the raw readout layer."""
-
-    @staticmethod
-    def _readout_repo_for(agg: AggregatedReadout) -> AsyncMock:
-        repo = AsyncMock()
-        repo.find_aggregated_by_molecules = AsyncMock(return_value={MOL_ID: {(RD_ID, None): agg}})
-        return repo
-
-    @staticmethod
-    def _agg(value: float = 3.4, count: int = 2) -> AggregatedReadout:
-        return AggregatedReadout(
-            readout_definition_id=RD_ID,
-            readout_name="IC50 (reported)",
-            value=value,
-            qualifier=">",
-            unit="nM",
-            aggregation="mean",
-            data_point_count=count,
-        )
-
-    @pytest.mark.asyncio
-    async def test_curveless_molecule_uses_reported_endpoint(self) -> None:
-        curve_repo = AsyncMock()
-        curve_repo.find_all_curves_for_molecules = AsyncMock(return_value={})
-        readout_repo = self._readout_repo_for(self._agg())
-
-        service = _make_service(curve_repo=curve_repo, readout_repo=readout_repo)
-        col_spec = f"drc:{RD_ID}"
-
-        result = await service.enrich_molecules(WS, [MOL_ID], [col_spec])
-
-        av = result[MOL_ID][col_spec]
-        assert av.source == "readout"
-        assert av.value == 3.4
-        assert av.qualifier == ">"
-        assert av.unit == "nM"
-        assert av.data_point_count == 2
-        # Curve-only fields stay empty — there is no fit behind this value.
-        assert av.curve_params is None
-        assert av.raw_data is None
-        assert av.intercept_values is None
-
-        # Only the raw layer of the DR readout-def is queried, for the one
-        # molecule the curve query left empty.
-        readout_repo.find_aggregated_by_molecules.assert_awaited_once_with(
-            WS, [MOL_ID], [(RD_ID, None)], wellless_only=True
-        )
-
-    @pytest.mark.asyncio
-    async def test_molecule_with_curves_ignores_reported_endpoint(self) -> None:
-        """A fitted curve still wins; the fallback isn't even fetched."""
-        curves, runs = _seed_runs([(date(2026, 4, 1), 5.2)])
-        readout_repo = self._readout_repo_for(self._agg(value=999.0))
-
-        service = _make_service(
-            curve_repo=_curve_repo_for(curves),
-            run_repo=_run_repo_for(runs),
-            readout_repo=readout_repo,
-        )
-        col_spec = f"drc:{RD_ID}"
-
-        result = await service.enrich_molecules(WS, [MOL_ID], [col_spec])
-
-        av = result[MOL_ID][col_spec]
-        assert av.source == "dose_response"
-        assert av.value == 5.2
-        readout_repo.find_aggregated_by_molecules.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_scoped_column_does_not_fall_back(self) -> None:
-        """The raw-layer aggregate carries no run filter, so a column the
-        chemist scoped to specific runs must not borrow an endpoint that could
-        have come from a run outside that scope."""
-        curve_repo = AsyncMock()
-        curve_repo.find_all_curves_for_molecules = AsyncMock(return_value={})
-        readout_repo = self._readout_repo_for(self._agg())
-
-        service = _make_service(curve_repo=curve_repo, readout_repo=readout_repo)
-        col_spec = f"drc:{RD_ID}"
-
-        result = await service.enrich_molecules(
-            WS,
-            [MOL_ID],
-            [col_spec],
-            run_scopes={col_spec: RunScope.last_n(3)},
-        )
-
-        assert result == {}
-        readout_repo.find_aggregated_by_molecules.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_explicitly_unscoped_column_still_falls_back(self) -> None:
-        curve_repo = AsyncMock()
-        curve_repo.find_all_curves_for_molecules = AsyncMock(return_value={})
-        readout_repo = self._readout_repo_for(self._agg())
-
-        service = _make_service(curve_repo=curve_repo, readout_repo=readout_repo)
-        col_spec = f"drc:{RD_ID}"
-
-        result = await service.enrich_molecules(
-            WS,
-            [MOL_ID],
-            [col_spec],
-            run_scopes={col_spec: RunScope.all()},
-        )
-
-        assert result[MOL_ID][col_spec].value == 3.4
-        readout_repo.find_aggregated_by_molecules.assert_awaited_once_with(
-            WS, [MOL_ID], [(RD_ID, None)], wellless_only=True
-        )
-
-    @pytest.mark.asyncio
-    async def test_no_curve_and_no_reported_endpoint_stays_absent(self) -> None:
-        curve_repo = AsyncMock()
-        curve_repo.find_all_curves_for_molecules = AsyncMock(return_value={})
-        readout_repo = AsyncMock()
-        readout_repo.find_aggregated_by_molecules = AsyncMock(return_value={})
-
-        service = _make_service(curve_repo=curve_repo, readout_repo=readout_repo)
-
-        result = await service.enrich_molecules(WS, [MOL_ID], [f"drc:{RD_ID}"])
-        assert result == {}
+# Reported-endpoint fallback (D1, per run filter and per group) is covered
+# against the real database in
+# tests/integration/application/screening/test_enrich_plan.py.
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +515,7 @@ class TestEnrichMoleculesMultiRunAggregation:
     """The new aggregator-driven path replaces best-R² cherry-picking."""
 
     @pytest.mark.asyncio
-    async def test_default_uses_latest_approved_run(self) -> None:
+    async def test_default_uses_latest_run(self) -> None:
         """3 runs: latest fitted IC50 = 0.20 wins under the default rule."""
         # Order matches what the SQL repo returns: newest first.
         curves, runs = _seed_runs(
@@ -630,7 +536,7 @@ class TestEnrichMoleculesMultiRunAggregation:
         av = out[MOL_ID][col_spec]
         assert av.value == 0.20
         assert av.run_count == 3
-        assert av.selection_rule == SelectionRule.LATEST_APPROVED_RUN.value
+        assert av.selection_rule == SelectionRule.LATEST_RUN.value
         assert av.runs is not None and len(av.runs) == 3
         # Tooltip rows are also sorted latest-first.
         assert av.runs[0].run_date == date(2026, 4, 1)
@@ -670,8 +576,8 @@ class TestEnrichMoleculesMultiRunAggregation:
 
     @pytest.mark.asyncio
     async def test_run_scope_caps_input(self) -> None:
-        """last_n=2 → only 2 curves are passed to the aggregator."""
-        # The SQL repo applies last_n itself; the service trusts what the
+        """A narrowing scope → only the repo's in-scope curves reach the aggregator."""
+        # The SQL repo applies the scope itself; the service trusts what the
         # repo returns. Mock returns only 2 curves to mirror that contract.
         curves, runs = _seed_runs(
             [
@@ -691,7 +597,7 @@ class TestEnrichMoleculesMultiRunAggregation:
             WS,
             [MOL_ID],
             [col_spec],
-            run_scopes={col_spec: RunScope.last_n(2)},
+            run_scopes={col_spec: RunScope.since(date(2026, 3, 1))},
         )
 
         av = out[MOL_ID][col_spec]
@@ -700,15 +606,13 @@ class TestEnrichMoleculesMultiRunAggregation:
         # Verify the scope was passed through to the repo call.
         service._curve_repo.find_all_curves_for_molecules.assert_awaited_once()
         kwargs = service._curve_repo.find_all_curves_for_molecules.await_args.kwargs
-        assert kwargs["run_scope"] == RunScope.last_n(2)
+        assert kwargs["run_scope"] == RunScope.since(date(2026, 3, 1))
 
     @pytest.mark.asyncio
     async def test_inactive_runs_trigger_disagreement(self) -> None:
         """2 active EQ runs + 1 Inactive run → disagreement_flag=True on the cell."""
         # Two healthy + one inactive; latest is healthy so cell still has a value.
-        active_a, runs_a = _seed_runs(
-            [(date(2026, 4, 1), 0.20), (date(2026, 3, 1), 0.40)]
-        )
+        active_a, runs_a = _seed_runs([(date(2026, 4, 1), 0.20), (date(2026, 3, 1), 0.40)])
         inactive, runs_inactive = _seed_runs(
             [(date(2026, 1, 1), 0.10)], curve_class=CurveClass.INACTIVE
         )
@@ -732,9 +636,7 @@ class TestEnrichMoleculesMultiRunAggregation:
     async def test_runs_payload_capped_at_10(self) -> None:
         """run_count carries the full history; runs[] is bounded to 10 entries."""
         # 15 runs, distinct dates so sort order is deterministic.
-        seeds = [
-            (date(2025, 1 + (i % 12), 1 + (i // 12)), 0.5 + i * 0.01) for i in range(15)
-        ]
+        seeds = [(date(2025, 1 + (i % 12), 1 + (i // 12)), 0.5 + i * 0.01) for i in range(15)]
         curves, runs = _seed_runs(seeds)
         service = _make_service(
             curve_repo=_curve_repo_for(curves),
@@ -830,8 +732,8 @@ class TestEnrichMoleculesMultiRunAggregation:
         assert len(av.additional_curves) == 1
 
     @pytest.mark.asyncio
-    async def test_latest_approved_run_omits_aggregate_overlay(self) -> None:
-        """LATEST_APPROVED_RUN doesn't aggregate → no overlay fields on the wire.
+    async def test_latest_run_omits_aggregate_overlay(self) -> None:
+        """LATEST_RUN doesn't aggregate → no overlay fields on the wire.
 
         The per-curve intercept dashed line correctly represents the cell
         value in this mode (because the cell IS the rep curve), so the
@@ -853,7 +755,7 @@ class TestEnrichMoleculesMultiRunAggregation:
             WS,
             [MOL_ID],
             [col_spec],
-            # Default rule is LATEST_APPROVED_RUN.
+            # Default rule is LATEST_RUN.
         )
 
         av = out[MOL_ID][col_spec]
@@ -938,13 +840,23 @@ class TestEnrichMoleculesAnyColumn:
     @pytest.mark.asyncio
     async def test_any_lists_protocols_best_first_in_native_units(self) -> None:
         run_a, run_b = uuid.uuid4(), uuid.uuid4()
-        curve_a = _make_curve(fitted_value=5.0, run_id=run_a,
-                              intercept_values=[_make_intercept_value(
-                                  kind=InterceptKind.IC, level=50.0, label="IC50", value=5.0)])
-        curve_b = _make_curve(protocol_id=PROTO_B, readout_definition_id=RD_B,
-                              fitted_value=5.0, run_id=run_b, curve_class=CurveClass.PARTIAL,
-                              intercept_values=[_make_intercept_value(
-                                  kind=InterceptKind.IC, level=50.0, label="IC50", value=5.0)])
+        curve_a = _make_curve(
+            fitted_value=5.0,
+            run_id=run_a,
+            intercept_values=[
+                _make_intercept_value(kind=InterceptKind.IC, level=50.0, label="IC50", value=5.0)
+            ],
+        )
+        curve_b = _make_curve(
+            protocol_id=PROTO_B,
+            readout_definition_id=RD_B,
+            fitted_value=5.0,
+            run_id=run_b,
+            curve_class=CurveClass.PARTIAL,
+            intercept_values=[
+                _make_intercept_value(kind=InterceptKind.IC, level=50.0, label="IC50", value=5.0)
+            ],
+        )
         curve_repo = AsyncMock()
         curve_repo.find_all_curves_for_molecules = AsyncMock(
             return_value={MOL_ID: {RD_ID: [curve_a], RD_B: [curve_b]}}
@@ -954,15 +866,20 @@ class TestEnrichMoleculesAnyColumn:
             run_b: _make_run(run_id=run_b, run_date=date(2026, 4, 2), protocol_id=PROTO_B),
         }
         service = _make_service(curve_repo=curve_repo, run_repo=_run_repo_for(runs))
-        service._protocol_repo.find_by_ids = AsyncMock(return_value=[
-            _make_protocol(protocol_id=PROTO_ID, name="Alpha", dose_unit="uM"),
-            _make_protocol(protocol_id=PROTO_B, name="Beta", dose_unit="nM"),
-        ])
+        service._protocol_repo.find_by_ids = AsyncMock(
+            return_value=[
+                _make_protocol(protocol_id=PROTO_ID, name="Alpha", dose_unit="uM"),
+                _make_protocol(protocol_id=PROTO_B, name="Beta", dose_unit="nM"),
+            ]
+        )
         from types import SimpleNamespace
-        service._protocol_repo.find_effective_targets_for_protocols = AsyncMock(return_value={
-            PROTO_ID: [SimpleNamespace(id=uuid.uuid4(), name="NadD")],
-            PROTO_B: [],
-        })
+
+        service._protocol_repo.find_effective_targets_for_protocols = AsyncMock(
+            return_value={
+                PROTO_ID: [SimpleNamespace(id=uuid.uuid4(), name="NadD")],
+                PROTO_B: [],
+            }
+        )
 
         result = await service.enrich_molecules(WS, [MOL_ID], ["any"])
 
@@ -989,34 +906,19 @@ class TestEnrichMoleculesAnyColumn:
 
     @pytest.mark.asyncio
     async def test_any_includes_named_readout_groups(self) -> None:
-        from cellar.domain.screening_assay.activity_types import AggregatedReadout
-
         curve_repo = AsyncMock()
         curve_repo.find_all_curves_for_molecules = AsyncMock(return_value={})
         service = _make_service(curve_repo=curve_repo)
         rd_x = uuid.uuid4()
-        service._readout_repo.find_aggregated_by_molecules_and_names = AsyncMock(
-            return_value={
-                MOL_ID: [
-                    (
-                        PROTO_B,
-                        AggregatedReadout(
-                            readout_definition_id=rd_x,
-                            readout_name="% Inhibition",
-                            value=82.0,
-                            qualifier=None,
-                            unit="%",
-                            aggregation="mean",
-                            data_point_count=3,
-                        ),
-                    )
-                ]
-            }
+        service._readout_repo.find_readout_definitions_by_names = AsyncMock(
+            return_value={rd_x: PROTO_B}
+        )
+        service._readout_repo.find_run_stats = AsyncMock(
+            return_value=[_run_stats(rd_x, run_date=date(2026, 4, 1), mean=82.0, count=3)]
         )
         service._protocol_repo.find_by_ids = AsyncMock(
             return_value=[_make_protocol(protocol_id=PROTO_B, name="Beta", dose_unit="uM")]
         )
-        service._protocol_repo.find_effective_targets_for_protocols = AsyncMock(return_value={})
 
         result = await service.enrich_molecules(
             WS, [MOL_ID], ["any"], any_readout_groups=[("% inhibition", "%")]
@@ -1029,7 +931,35 @@ class TestEnrichMoleculesAnyColumn:
             "readout",
         )
         assert entry.value_um is None and entry.curve_class is None
-        assert entry.protocol_name == "Beta" and entry.run_count == 3
+        assert entry.protocol_name == "Beta" and entry.run_count == 1
+        assert entry.readout_definition_id == rd_x
+
+
+def _run_stats(rd_id: uuid.UUID, *, run_date: date, mean: float, count: int) -> RunReadoutStats:
+    return RunReadoutStats(
+        molecule_id=MOL_ID,
+        readout_definition_id=rd_id,
+        normalization=None,
+        run_id=uuid.uuid4(),
+        run_date=run_date,
+        run_status="approved",
+        protocol_id=PROTO_B,
+        unit="%",
+        aggregation="mean",
+        readout_name="% Inhibition",
+        stats=ReplicateStats(
+            eq_count=count,
+            eq_mean=mean,
+            eq_median=mean,
+            eq_min=mean,
+            eq_max=mean,
+            eq_geomean=mean,
+            gt_count=0,
+            gt_max_bound=None,
+            lt_count=0,
+            lt_min_bound=None,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1133,6 +1063,8 @@ class TestGetActivitySummaryReportedEndpoints:
         assert len(proto.best_curves) == 1
         assert proto.best_curves[0]["fitted_value"] == 5.2
         assert proto.readouts == []
+        # Curves: the results live on the run's Dose-Response tab.
+        assert proto.results_tab == "dose-response"
         readout_repo.find_aggregated_by_molecules.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1146,3 +1078,167 @@ class TestGetActivitySummaryReportedEndpoints:
 
         assert summary.protocols == []
         readout_repo.find_aggregated_by_molecules.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# get_activity_summary — plain (non-dose-response) readouts and the hit marker.
+# ---------------------------------------------------------------------------
+
+
+class TestGetActivitySummaryPlainReadouts:
+    """A thermal-shift protocol has no curves; its readouts still earn a card."""
+
+    DRAFT_RUN = uuid.uuid4()
+    DONE_RUN = uuid.uuid4()
+
+    @staticmethod
+    def _rd(name: str, measure: str | None, unit: str = "°C"):
+        from cellar.domain.screening_assay.enums import ReadoutAggregation, ReadoutDataType
+        from cellar.domain.screening_assay.melt_window import MeltMeasure, MeltReadoutConfig
+        from cellar.domain.screening_assay.protocol import ReadoutDefinition
+
+        param = {}
+        if measure == "lowest_shift_concentration":
+            param = {"threshold": 2.0}
+        cfg = (
+            MeltReadoutConfig(
+                window="Main",
+                measure=MeltMeasure(measure),
+                channel_key="ratio",
+                low=50.0,
+                high=85.0,
+                **param,
+            )
+            if measure
+            else None
+        )
+        return ReadoutDefinition(
+            protocol_id=PROTO_ID,
+            name=name,
+            data_type=ReadoutDataType.NUMERIC,
+            unit=unit,
+            aggregation=ReadoutAggregation.MEAN,
+            melt_config=cfg,
+        )
+
+    def _setup(self, criteria=None):
+        from cellar.domain.screening_assay.enums import ReadoutNormalization
+        from cellar.domain.shared.enums import Qualifier
+        from cellar.domain.shared.value_objects import QualifiedValue
+
+        dtm = self._rd("ΔTm (Main)", "delta_tm")
+        mx = self._rd("Max ΔTm (Main)", "max_delta_tm")
+        low = self._rd("Lowest shifting conc. (Main, ±2 °C)", "lowest_shift_concentration", "uM")
+
+        def row(rd, run, value, *, q=Qualifier.EQUAL, well=True, norm=None, outlier=False):
+            return ReadoutData(
+                workspace_id=WS,
+                run_id=run,
+                well_id=uuid.uuid4() if well else None,
+                molecule_id=MOL_ID,
+                readout_definition_id=rd.id,
+                value=QualifiedValue(value=value, qualifier=q),
+                is_computed=True,
+                normalization_applied=norm,
+                is_outlier=outlier,
+            )
+
+        rows = [
+            row(dtm, self.DRAFT_RUN, -8.5),
+            row(dtm, self.DRAFT_RUN, -7.8),
+            row(dtm, self.DRAFT_RUN, 1.4),
+            row(dtm, self.DRAFT_RUN, -30.0, outlier=True),
+            row(dtm, self.DRAFT_RUN, 99.0, norm=ReadoutNormalization.PERCENT_INHIBITION),
+            row(mx, self.DRAFT_RUN, -8.5, well=False),
+            row(low, self.DRAFT_RUN, 6.25, well=False),
+            row(low, self.DONE_RUN, 50.0, q=Qualifier.GREATER_THAN, well=False),
+        ]
+        readout_repo = AsyncMock()
+        readout_repo.find_by_molecule = AsyncMock(return_value=rows)
+        readout_repo.find_aggregated_by_molecules = AsyncMock(return_value={})
+        curve_repo = AsyncMock()
+        curve_repo.find_by_molecule = AsyncMock(return_value=[])
+        service = _make_service(
+            curve_repo=curve_repo,
+            run_repo=_run_repo_for(
+                {
+                    self.DRAFT_RUN: _make_run(
+                        run_id=self.DRAFT_RUN,
+                        run_date=date(2026, 11, 13),
+                        status=RunStatus.DRAFT,
+                        notes="Second walk-through run",
+                    ),
+                    self.DONE_RUN: _make_run(run_id=self.DONE_RUN, run_date=date(2026, 11, 1)),
+                }
+            ),
+            readout_repo=readout_repo,
+        )
+        proto = _make_protocol(
+            protocol_id=PROTO_ID, name="Thermal", dose_unit="uM", readout_defs=[dtm, mx, low]
+        )
+        proto.recommended_hit_criteria = criteria
+        service._protocol_repo.find_by_ids = AsyncMock(return_value=[proto])
+        return service
+
+    @pytest.mark.asyncio
+    async def test_plain_readouts_earn_a_card_with_best_value_runs_and_drafts(self) -> None:
+        summary = await self._setup().get_activity_summary(WS, MOL_ID)
+
+        [card] = summary.protocols
+        assert card.best_curves == [] and card.readouts == []
+        got = {r.readout_name: r for r in card.plain_readouts}
+        assert list(got) == [
+            "ΔTm (Main)",
+            "Max ΔTm (Main)",
+            "Lowest shifting conc. (Main, ±2 °C)",
+        ]
+        dtm = got["ΔTm (Main)"]
+        # Largest shift either way; the outlier and the normalized layer are left out.
+        assert (dtm.value, dtm.qualifier, dtm.data_point_count) == (-8.5, "=", 3)
+        assert (dtm.run_count, dtm.draft_run_count, dtm.unit) == (1, 1, "°C")
+        low = got["Lowest shifting conc. (Main, ±2 °C)"]
+        assert (low.value, low.qualifier, low.run_count, low.draft_run_count) == (6.25, "=", 2, 1)
+        assert card.hit is None and card.hit_criteria == []
+
+    @pytest.mark.asyncio
+    async def test_hit_marker_follows_the_protocol_recommendation(self) -> None:
+        from cellar.domain.shared.hit_criterion import HitCriterion
+
+        outside = HitCriterion(
+            readout_name="Max ΔTm (Main)", operator="not_between", value=[-2.0, 2.0]
+        )
+        summary = await self._setup([outside]).get_activity_summary(WS, MOL_ID)
+        [card] = summary.protocols
+        assert card.hit is True
+        assert card.hit_criteria == [outside.to_dict()]
+
+        big = HitCriterion(readout_name="ΔTm (Main)", operator="gt", value=5.0)
+        [card] = (await self._setup([outside, big]).get_activity_summary(WS, MOL_ID)).protocols
+        assert card.hit is False
+
+        missing = HitCriterion(readout_name="Not measured", operator="gt", value=0.0)
+        [card] = (await self._setup([missing]).get_activity_summary(WS, MOL_ID)).protocols
+        assert card.hit is False
+
+    @pytest.mark.asyncio
+    async def test_card_names_the_protocol_its_runs_and_where_to_look(self) -> None:
+        service = self._setup()
+        [proto] = service._protocol_repo.find_by_ids.return_value
+        proto.code = "PRT-00219"
+
+        [card] = (await service.get_activity_summary(WS, MOL_ID)).protocols
+
+        assert card.protocol_code == "PRT-00219"
+        # Newest first, with status, so the page can link each and mark drafts.
+        assert [(r.run_id, r.run_date, r.status, r.notes) for r in card.runs] == [
+            (self.DRAFT_RUN, date(2026, 11, 13), "draft", "Second walk-through run"),
+            (self.DONE_RUN, date(2026, 11, 1), "approved", None),
+        ]
+        # Thermal-shift readouts: the results live on the run's Traces tab.
+        assert card.results_tab == "curves"
+        directions = {r.readout_name: r.best_direction for r in card.plain_readouts}
+        assert directions == {
+            "ΔTm (Main)": "magnitude",
+            "Max ΔTm (Main)": "magnitude",
+            "Lowest shifting conc. (Main, ±2 °C)": "low",
+        }
